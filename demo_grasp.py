@@ -53,15 +53,40 @@ def main() -> None:
     if not robot.connect():
         raise RuntimeError(f"로봇 연결 실패: {args.address}")
 
-    # 실습 편의를 위해 전원과 서보를 켜고 제어 관리자를 활성화한다.
-    if not robot.power_on(".*"):
-        raise RuntimeError("로봇 전원을 켜지 못했습니다.")
-    if not robot.servo_on(".*"):
-        raise RuntimeError("서보를 켜지 못했습니다.")
 
-    robot.reset_fault_control_manager()
-    if not robot.enable_control_manager(unlimited_mode_enabled=True):
-        raise RuntimeError("제어 관리자를 활성화하지 못했습니다.")
+
+    # 전원이 꺼져 있을 때만 전원을 켠다.
+    if robot.is_power_on(".*"):
+        print("Power: 이미 켜져 있음")
+    else:
+        power_result = robot.power_on(".*")
+        print(f"power_on 결과: {power_result}")
+
+    # 서보가 꺼져 있을 때만 서보를 켠다.
+    if robot.is_servo_on(".*"):
+        print("Servo: 이미 켜져 있음")
+    else:
+        servo_result = robot.servo_on(".*")
+        print(f"servo_on 결과: {servo_result}")
+
+    # Control Manager에 fault가 있을 때만 초기화한다.
+    cm_state = robot.get_control_manager_state()
+    print(f"Control Manager 상태: {cm_state.state}")
+
+    if cm_state.state in (
+        rby.ControlManagerState.State.MajorFault,
+        rby.ControlManagerState.State.MinorFault,
+    ):
+        print("Control Manager fault를 초기화합니다.")
+        reset_result = robot.reset_fault_control_manager()
+        print(f"reset_fault_control_manager 결과: {reset_result}")
+
+    # 현재 코드는 Joint Position 제어이므로 unlimited mode가 필요하지 않다.
+    enable_result = robot.enable_control_manager(
+        unlimited_mode_enabled=False,
+    )
+    print(f"enable_control_manager 결과: {enable_result}")
+
 
     print("[1/2] Before-grasp 자세로 이동합니다. (5초)")
     move_both_arms(robot, BEFORE_GRASP_RIGHT, BEFORE_GRASP_LEFT, minimum_time=5.0)
