@@ -141,7 +141,7 @@ def marker_plane_yaw_error_deg(marker):
     """마커 평면을 기준으로 모바일 베이스가 보정해야 할 yaw 오차 [deg]를 계산한다."""
     rotation = marker.rotation_matrix
 
-    marker_up = rotation[:, 0]
+    marker_up = rotation[:, 1]
     marker_up = marker_up / (np.linalg.norm(marker_up) + 1e-12)
 
     normal = rotation[:, 2]

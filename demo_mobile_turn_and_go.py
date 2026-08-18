@@ -32,7 +32,7 @@ TURN_TARGET = (
 
 # LEG 2: LEG 1 종료 자세 기준으로 앞으로 직진
 STRAIGHT_TARGET = (
-    0.85,  # forward [m]
+    0.75,  # forward [m]
     0.0,   # lateral [m]
     0.0,   # rotation [rad]
 )

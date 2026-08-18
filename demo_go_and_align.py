@@ -14,17 +14,17 @@ from skills.ar_align import align_to_marker
 ADDRESS = "192.168.30.1:50051"
 
 DRIVE_TARGET = (
-    0.80,  # x [m]
+    0.0,  # x [m]
     0.0,   # y [m]
     0.0,   # theta [rad]
 )
 
 DRIVE_DURATION = 5.0
 
-MARKER_ID = 7
+MARKER_ID = 8
 
 # 여러 RealSense가 연결되어 있다면 D405 시리얼을 문자열로 지정한다.
-CAMERA_SERIAL = None
+CAMERA_SERIAL = "409122274689"
 
 
 def main():
@@ -47,7 +47,7 @@ def main():
             turn_direction="shortest",
         )
 
-        print("STEP 1: 0.80 m 직진")
+        print("STEP 1: 0.20 m 직진")
 
         if not move_leg(robot, monitor, drive_leg, settle=1.0):
             print("직진 실패")
