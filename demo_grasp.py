@@ -6,11 +6,15 @@ import numpy as np
 import rby1_sdk as rby
 
 
-BEFORE_GRASP_RIGHT = np.deg2rad([-33.0, -43.0, -24.0, -84.0, -60.0, 87.0, -13.0])
-BEFORE_GRASP_LEFT = np.deg2rad([-33.0, 43.0, 24.0, -84.0, 60.0, 87.0, 13.0])
+BEFORE_GRASP_RIGHT = np.deg2rad([-31.0, -54.0, -10.0, -91.0, -57.0, 87.0, -13.0])
+BEFORE_GRASP_LEFT = np.deg2rad([-31.0, 54.0, 10.0, -91.0, 57.0, 87.0, 13.0])
 
-GRASP_RIGHT = np.deg2rad([-33.0, -32.0, -13.5, -86.0, -57.0, 87.0, -13.0])
-GRASP_LEFT = np.deg2rad([-33.0, 32.0, 13.5, -86.0, 57.0, 87.0, 13.0])
+GRASP_RIGHT = np.deg2rad([-31.0, -43.5, -9.0, -91.0, -57.0, 87.0, -13.0])
+GRASP_LEFT = np.deg2rad([-31.0, 43.5, 9.0, -91.0, 57.0, 87.0, 13.0])
+
+
+UP_RIGHT = np.deg2rad([-31.0, -43.5, -17.0, -89.0, -65.0, 87.0, -13.0])
+UP_LEFT = np.deg2rad([-31.0, 43.5, 17.0, -89.0, 65.0, 87.0, 13.0])
 
 
 def create_robot(address: str, model: str):
@@ -88,13 +92,18 @@ def main() -> None:
     print(f"enable_control_manager 결과: {enable_result}")
 
 
-    print("[1/2] Before-grasp 자세로 이동합니다. (5초)")
-    move_both_arms(robot, BEFORE_GRASP_RIGHT, BEFORE_GRASP_LEFT, minimum_time=5.0)
+    print("[1/2] Before-grasp 자세로 이동합니다. (3초)")
+    move_both_arms(robot, BEFORE_GRASP_RIGHT, BEFORE_GRASP_LEFT, minimum_time=3.0)
 
     print("[2/2] Grasp 자세로 이동합니다. (3초)")
     move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=3.0)
 
     print("Grasp 자세 이동 완료")
+
+
+    move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.0)
+
+    print("box up")
 
 
 if __name__ == "__main__":
