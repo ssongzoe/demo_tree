@@ -6,7 +6,8 @@
 2. 0.10 m 후진 → 회전하며 이동 → 직진
 3. AR 마커 기준 yaw 및 위치 정렬
 4. UP → Grasp → 그리퍼 열기 → Before-grasp
-5. 모든 연결과 제어 종료
+5. 0.20 m 후진 → 출발 때와 반대 방향으로 회전 → 0.80 m 직진
+6. 모든 연결과 제어 종료
 """
 
 import argparse
@@ -45,10 +46,14 @@ TURN_TARGET = (
 
 STRAIGHT_TARGET = (0.75, 0.0, 0.0)
 
+RETURN_BACK_TARGET = (-0.20, 0.0, 0.0)
+RETURN_TURN_TARGET = (0.0, 0.0, math.radians(179.43))
+RETURN_STRAIGHT_TARGET = (0.80, 0.0, 0.0)
+
 MARKER_ID = 8
 CAMERA_SERIAL = "409122274689"
 
-DEFAULT_GRIPPER_TARGET = 0.35
+DEFAULT_GRIPPER_TARGET = 0.20
 DEFAULT_GRIPPER_TORQUE = 0.20
 
 
@@ -106,7 +111,7 @@ def run_turn_and_go(robot, monitor) -> bool:
             stream,
             name="모바일 2/3: 회전 + 이동",
             target=TURN_TARGET,
-            duration=10.0,
+            duration=7.0,
             stop_at_end=False,
             settle=0.0,
         ):
@@ -133,16 +138,67 @@ def run_turn_and_go(robot, monitor) -> bool:
         stream.wait_for(500)
 
 
+def run_return_route(robot, monitor) -> bool:
+    """0.20 m 후진, 왼쪽 회전, 0.80 m 직진으로 복귀 장면을 수행한다."""
+    stream = robot.create_command_stream(priority=10)
+
+    try:
+        if not run_mobile_leg(
+            robot,
+            monitor,
+            stream,
+            name="복귀 1/3: 0.20 m 후진",
+            target=RETURN_BACK_TARGET,
+            duration=3.0,
+            stop_at_end=False,
+            settle=0.0,
+        ):
+            print("복귀 0.20 m 후진 실패")
+            return False
+
+        if not run_mobile_leg(
+            robot,
+            monitor,
+            stream,
+            name="복귀 2/3: 왼쪽 제자리 회전",
+            target=RETURN_TURN_TARGET,
+            duration=10.0,
+            stop_at_end=False,
+            settle=0.0,
+        ):
+            print("복귀 왼쪽 회전 실패")
+            return False
+
+        if not run_mobile_leg(
+            robot,
+            monitor,
+            stream,
+            name="복귀 3/3: 0.80 m 직진",
+            target=RETURN_STRAIGHT_TARGET,
+            duration=5.0,
+            stop_at_end=True,
+            settle=1.5,
+        ):
+            print("복귀 0.80 m 직진 실패")
+            return False
+
+        return True
+
+    finally:
+        stream.cancel()
+        stream.wait_for(500)
+
+
 def grasp_and_lift(robot, gripper, gripper_target: float, gripper_torque: float) -> None:
     """박스 파지 자세로 이동한 뒤 그리퍼를 닫고 Box-up 자세로 들어 올린다."""
-    print("[1/8] Before-grasp 자세")
-    move_both_arms(robot, BEFORE_GRASP_RIGHT, BEFORE_GRASP_LEFT, minimum_time=1.5)
+    print("[1/9] Before-grasp 자세")
+    move_both_arms(robot, BEFORE_GRASP_RIGHT, BEFORE_GRASP_LEFT, minimum_time=1.0)
 
-    print("[2/8] Grasp 자세")
+    print("[2/9] Grasp 자세")
     move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0)
 
     print(
-        f"[3/8] 그리퍼 닫기: target={gripper_target:.2f}, "
+        f"[3/9] 그리퍼 닫기: target={gripper_target:.2f}, "
         f"torque={gripper_torque:.2f} Nm"
     )
     gripper.close(
@@ -150,25 +206,22 @@ def grasp_and_lift(robot, gripper, gripper_target: float, gripper_torque: float)
         torque=gripper_torque,
         duration=1.0,
     )
-    time.sleep(0.5)
     print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
 
-    print("[4/8] Box-up 자세")
-    move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=2.0)
-    time.sleep(0.5)
+    print("[4/9] Box-up 자세")
+    move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.0)
 
 
 def lower_release_and_retract(robot, gripper) -> None:
     """UP 자세에서 박스를 내리고 놓은 뒤 Before-grasp 자세로 후퇴한다."""
-    print("[7/8] UP → Grasp 자세")
-    move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=2.0)
+    print("[7/9] UP → Grasp 자세")
+    move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0)
 
     print("그리퍼 열기")
     gripper.open(duration=1.0)
-    time.sleep(0.5)
 
-    print("[8/8] Grasp → Before-grasp 자세")
-    move_both_arms(robot, BEFORE_GRASP_RIGHT, BEFORE_GRASP_LEFT, minimum_time=1.5)
+    print("[8/9] Grasp → Before-grasp 자세")
+    move_both_arms(robot, BEFORE_GRASP_RIGHT, BEFORE_GRASP_LEFT, minimum_time=1.0)
 
 
 def main() -> None:
@@ -225,11 +278,11 @@ def main() -> None:
         if not wait_for_odometry(monitor):
             raise RuntimeError("Odometry를 받지 못했습니다.")
 
-        print("[5/8] 0.10 m 후진 → Turn-and-go")
+        print("[5/9] 0.10 m 후진 → Turn-and-go")
         if not run_turn_and_go(robot, monitor):
             raise RuntimeError("Turn-and-go 실패")
 
-        print("[6/8] AR 마커 정렬")
+        print("[6/9] AR 마커 정렬")
         if not align_to_marker(
             robot,
             monitor,
@@ -239,6 +292,11 @@ def main() -> None:
             raise RuntimeError("AR 마커 정렬 실패")
 
         lower_release_and_retract(robot, gripper)
+
+        print("[9/9] 0.20 m 후진 → 왼쪽 회전 → 0.80 m 직진")
+        if not run_return_route(robot, monitor):
+            raise RuntimeError("복귀 주행 실패")
+
         demo_completed = True
         print("통합 데모 완료")
 

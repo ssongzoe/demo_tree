@@ -116,10 +116,9 @@ class GripperController:
         self._set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
 
         # 실제 그리퍼 장착 방향
-        # Right: max encoder = OPEN, min encoder = CLOSED
-        # Left:  min encoder = OPEN, max encoder = CLOSED
-        self._open_rad = np.array([max_q[0], min_q[1]],dtype=np.float64)
-        self._close_rad = np.array([min_q[0], max_q[1]],dtype=np.float64)
+        # 실제 장착 기준: 양쪽 모두 높은 encoder 값이 OPEN, 낮은 값이 CLOSED
+        self._close_rad = np.array([max_q[0], max_q[1]],dtype=np.float64)
+        self._open_rad = np.array([min_q[0], min_q[1]],dtype=np.float64)
 
 
         spans = np.abs(self._close_rad - self._open_rad)
