@@ -115,8 +115,12 @@ class GripperController:
         self._bus.group_sync_write_send_torque([(dev_id, 0.0) for dev_id in GRIPPER_IDS])
         self._set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
 
-        self._open_rad = np.array([min_q[0], max_q[1]], dtype=np.float64)
-        self._close_rad = np.array([max_q[0], min_q[1]], dtype=np.float64)
+        # 실제 그리퍼 장착 방향
+        # Right: max encoder = OPEN, min encoder = CLOSED
+        # Left:  min encoder = OPEN, max encoder = CLOSED
+        self._open_rad = np.array([max_q[0], min_q[1]],dtype=np.float64)
+        self._close_rad = np.array([min_q[0], max_q[1]],dtype=np.float64)
+
 
         spans = np.abs(self._close_rad - self._open_rad)
         if np.any(spans < 0.01):
