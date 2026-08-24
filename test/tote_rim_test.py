@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
-"""D435 RGB에서 토트박스 상단 rim의 대표 4개 직선을 검출하는 테스트.
+"""D435 RGB에서 토트 opening의 사다리꼴과 4개 corner를 검출한다.
 
-검출 대상
-- BACK  : 토트 뒤쪽 rim
-- FRONT : 토트 앞쪽 rim
-- LEFT  : 토트 왼쪽 rim
-- RIGHT : 토트 오른쪽 rim
+Canny + HoughLinesP로 rim 후보선을 찾고, 네 선 조합의 기하 구조와 내부 밝기, edge support를 평가한다.
+Depth와 로봇 제어는 사용하지 않으며, 현재 단계에서는 TL/TR/BR/BL corner 검출 안정성만 확인한다.
 
-Depth와 로봇 제어는 사용하지 않는다.
-현재 단계의 목적은 RGB 영상에서 대표 네 선이 안정적으로 잡히는지 확인하는 것이다.
-
-사용법
-python test/tote_rim_test.py
+사용법:
 python test/tote_rim_test.py --serial 250122079439
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import math
 
 import cv2
@@ -26,7 +20,7 @@ import pyrealsense2 as rs
 
 
 # ============================================================
-# 카메라 설정
+# 카메라
 # ============================================================
 
 CAM_WIDTH = 640
@@ -35,256 +29,178 @@ CAM_FPS = 30
 
 
 # ============================================================
-# Edge / Hough 설정
+# Edge / Hough
 # ============================================================
 
 CANNY_LOW = 40
 CANNY_HIGH = 120
 
-HOUGH_THRESHOLD = 50
-MIN_LINE_LENGTH = 70
+HOUGH_THRESHOLD = 45
+MIN_LINE_LENGTH = 60
 MAX_LINE_GAP = 35
 
 
 # ============================================================
 # 관심 영역
-#
-# 현재 카메라에서는 토트가 화면 아래쪽 대부분을 차지하므로
-# 위쪽 배경 물체를 최대한 제외한다.
 # ============================================================
 
-ROI_LEFT_RATIO = 0.05
-ROI_RIGHT_RATIO = 0.95
-ROI_TOP_RATIO = 0.40
-ROI_BOTTOM_RATIO = 0.98
+ROI_LEFT_RATIO = 0.01
+ROI_RIGHT_RATIO = 0.99
+ROI_TOP_RATIO = 0.10
+ROI_BOTTOM_RATIO = 0.99
 
 
 # ============================================================
-# 선 분류 각도
-#
-# 영상 좌표계 기준 line angle은 0~180 deg.
-#
-# 현재 영상 예:
-# BACK / FRONT : 약 178~179 deg
-# LEFT         : 약 106~107 deg
-# RIGHT        : 약 65 deg
+# 후보선 각도
 # ============================================================
 
-HORIZONTAL_MAX_DEG = 15.0
+HORIZONTAL_MAX_DEG = 18.0
 
-LEFT_MIN_DEG = 90.0
-LEFT_MAX_DEG = 135.0
+LEFT_MIN_DEG = 92.0
+LEFT_MAX_DEG = 140.0
 
-RIGHT_MIN_DEG = 45.0
-RIGHT_MAX_DEG = 90.0
+RIGHT_MIN_DEG = 40.0
+RIGHT_MAX_DEG = 88.0
+
+MAX_HORIZONTAL_CANDIDATES = 14
+MAX_LEFT_CANDIDATES = 10
+MAX_RIGHT_CANDIDATES = 10
 
 
-# 대표선 fitting에 너무 많은 선을 넣지 않는다.
-MAX_GROUP_LINES = 8
+# ============================================================
+# 사다리꼴 조건
+# ============================================================
+
+MIN_OPENING_HEIGHT_RATIO = 0.22
+MIN_OPENING_WIDTH_RATIO = 0.40
+MIN_AREA_RATIO = 0.16
+
+MIN_BACK_FRONT_WIDTH_RATIO = 0.45
+MAX_BACK_FRONT_WIDTH_RATIO = 1.05
+
+CORNER_MARGIN_RATIO = 0.08
 
 
-def line_info(line):
+# ============================================================
+# 밝기 / Edge score
+# ============================================================
+
+DARK_THRESHOLD = 100
+MIN_DARK_FRACTION = 0.45
+
+EDGE_SAMPLE_COUNT = 50
+EDGE_SEARCH_RADIUS = 3
+
+
+@dataclass
+class LineCandidate:
+    """Hough 선분 하나와 무한 직선 표현."""
+
+    segment: np.ndarray
+    length: float
+    angle_deg: float
+    center_x: float
+    center_y: float
+    line_abc: np.ndarray
+
+
+@dataclass
+class ToteDetection:
+    """최종 선택된 토트 opening."""
+
+    corners: np.ndarray
+    score: float
+    dark_fraction: float
+    edge_support: float
+
+
+def line_info(segment: np.ndarray):
     """선분의 길이, 각도, 중심점을 계산한다."""
-    x1, y1, x2, y2 = [float(value) for value in line]
+    x1, y1, x2, y2 = [float(value) for value in segment]
 
     dx = x2 - x1
     dy = y2 - y1
 
     length = math.hypot(dx, dy)
     angle = math.degrees(math.atan2(dy, dx)) % 180.0
+    center_x = 0.5 * (x1 + x2)
+    center_y = 0.5 * (y1 + y2)
 
-    cx = 0.5 * (x1 + x2)
-    cy = 0.5 * (y1 + y2)
-
-    return length, angle, cx, cy
-
-
-def is_horizontal(angle_deg):
-    """0도 또는 180도 근처의 수평선을 판별한다."""
-    return (
-        angle_deg <= HORIZONTAL_MAX_DEG
-        or angle_deg >= 180.0 - HORIZONTAL_MAX_DEG
-    )
+    return length, angle, center_x, center_y
 
 
-def fit_representative_line(lines):
-    """여러 Hough 선분을 하나의 대표 직선으로 fitting한다."""
-    if not lines:
+def segment_to_line(segment: np.ndarray) -> np.ndarray:
+    """두 점 선분을 ax + by + c = 0 형태의 무한 직선으로 변환한다."""
+    x1, y1, x2, y2 = [float(value) for value in segment]
+
+    a = y1 - y2
+    b = x2 - x1
+    c = x1 * y2 - x2 * y1
+    norm = math.hypot(a, b)
+
+    if norm < 1e-9:
+        raise ValueError("길이가 0인 선분입니다.")
+
+    return np.asarray([a / norm, b / norm, c / norm], dtype=np.float64)
+
+
+def intersection(first: np.ndarray, second: np.ndarray) -> np.ndarray | None:
+    """두 무한 직선의 교점을 계산한다."""
+    a1, b1, c1 = first
+    a2, b2, c2 = second
+
+    determinant = a1 * b2 - a2 * b1
+
+    if abs(determinant) < 1e-8:
         return None
 
-    # 긴 선을 우선 사용한다.
-    selected = sorted(
-        lines,
-        key=lambda item: item[0],
-        reverse=True,
-    )[:MAX_GROUP_LINES]
+    x = (b1 * c2 - b2 * c1) / determinant
+    y = (c1 * a2 - c2 * a1) / determinant
 
-    points = []
-
-    for _, line in selected:
-        x1, y1, x2, y2 = line
-
-        points.append([x1, y1])
-        points.append([x2, y2])
-
-    points = np.asarray(points, dtype=np.float32)
-
-    vx, vy, x0, y0 = cv2.fitLine(
-        points,
-        cv2.DIST_L2,
-        0,
-        0.01,
-        0.01,
-    ).reshape(-1)
-
-    return np.asarray(
-        [vx, vy, x0, y0],
-        dtype=np.float64,
-    )
-
-
-def fitted_line_angle_deg(fitted):
-    """cv2.fitLine 결과의 line angle을 계산한다."""
-    vx, vy, _, _ = fitted
-    return math.degrees(math.atan2(vy, vx)) % 180.0
-
-
-def fitted_line_midpoint_y(fitted, width):
-    """화면 중앙 x에서 representative line의 y 위치를 계산한다."""
-    vx, vy, x0, y0 = fitted
-
-    x = width * 0.5
-
-    if abs(vx) < 1e-8:
-        return float(y0)
-
-    return float(y0 + (x - x0) * vy / vx)
-
-
-def clip_fitted_line(fitted, roi):
-    """무한 직선을 ROI 안에서 그릴 수 있는 두 점으로 변환한다."""
-    vx, vy, x0, y0 = fitted
-
-    scale = 2000.0
-
-    p1 = (
-        int(round(x0 - scale * vx)),
-        int(round(y0 - scale * vy)),
-    )
-
-    p2 = (
-        int(round(x0 + scale * vx)),
-        int(round(y0 + scale * vy)),
-    )
-
-    x, y, width, height = roi
-
-    success, clipped_p1, clipped_p2 = cv2.clipLine(
-        (x, y, width, height),
-        p1,
-        p2,
-    )
-
-    if not success:
+    if not np.isfinite(x) or not np.isfinite(y):
         return None
 
-    return clipped_p1, clipped_p2
+    return np.asarray([x, y], dtype=np.float64)
 
 
-def split_horizontal_groups(horizontal_lines, width):
-    """수평선 후보를 위쪽 BACK과 아래쪽 FRONT 두 그룹으로 나눈다."""
-    if len(horizontal_lines) < 2:
-        return [], []
+def is_horizontal(angle_deg: float) -> bool:
+    """0도 또는 180도 근처의 선인지 확인한다."""
+    return angle_deg <= HORIZONTAL_MAX_DEG or angle_deg >= 180.0 - HORIZONTAL_MAX_DEG
 
-    # 각 선분의 화면 y 중심값.
-    values = np.asarray(
-        [item[2] for item in horizontal_lines],
-        dtype=np.float64,
+
+def make_candidate(segment: np.ndarray) -> LineCandidate:
+    """Hough 선분을 후보 객체로 변환한다."""
+    length, angle, center_x, center_y = line_info(segment)
+
+    return LineCandidate(
+        segment=np.asarray(segment, dtype=np.float64),
+        length=length,
+        angle_deg=angle,
+        center_x=center_x,
+        center_y=center_y,
+        line_abc=segment_to_line(segment),
     )
 
-    # 간단한 1D two-cluster.
-    center_a = float(np.min(values))
-    center_b = float(np.max(values))
 
-    labels = np.zeros(len(values), dtype=np.int32)
-
-    for _ in range(10):
-        distance_a = np.abs(values - center_a)
-        distance_b = np.abs(values - center_b)
-
-        labels = (distance_b < distance_a).astype(np.int32)
-
-        group_a = values[labels == 0]
-        group_b = values[labels == 1]
-
-        if len(group_a):
-            center_a = float(np.mean(group_a))
-
-        if len(group_b):
-            center_b = float(np.mean(group_b))
-
-    first = [
-        horizontal_lines[index]
-        for index in range(len(horizontal_lines))
-        if labels[index] == 0
-    ]
-
-    second = [
-        horizontal_lines[index]
-        for index in range(len(horizontal_lines))
-        if labels[index] == 1
-    ]
-
-    # y가 작은 쪽이 토트 뒤쪽 rim.
-    if center_a <= center_b:
-        return first, second
-
-    return second, first
-
-
-def detect_rim_lines(image):
-    """RGB 영상에서 BACK / FRONT / LEFT / RIGHT 대표선을 찾는다."""
+def detect_line_candidates(image: np.ndarray):
+    """Hough 후보를 horizontal / left / right 세 그룹으로 나눈다."""
     height, width = image.shape[:2]
-
-    roi_x0 = int(width * ROI_LEFT_RATIO)
-    roi_x1 = int(width * ROI_RIGHT_RATIO)
-    roi_y0 = int(height * ROI_TOP_RATIO)
-    roi_y1 = int(height * ROI_BOTTOM_RATIO)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, CANNY_LOW, CANNY_HIGH)
 
-    edges = cv2.Canny(
-        gray,
-        CANNY_LOW,
-        CANNY_HIGH,
-    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    # 끊긴 rim edge를 조금 연결한다.
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (3, 3),
-    )
+    x0 = int(width * ROI_LEFT_RATIO)
+    x1 = int(width * ROI_RIGHT_RATIO)
+    y0 = int(height * ROI_TOP_RATIO)
+    y1 = int(height * ROI_BOTTOM_RATIO)
 
-    edges = cv2.morphologyEx(
-        edges,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=1,
-    )
-
-    # ROI 밖의 edge는 Hough 입력에서 제거한다.
     roi_mask = np.zeros_like(edges)
-
-    roi_mask[
-        roi_y0:roi_y1,
-        roi_x0:roi_x1,
-    ] = 255
-
-    roi_edges = cv2.bitwise_and(
-        edges,
-        roi_mask,
-    )
+    roi_mask[y0:y1, x0:x1] = 255
+    roi_edges = cv2.bitwise_and(edges, roi_mask)
 
     detected = cv2.HoughLinesP(
         roi_edges,
@@ -296,287 +212,321 @@ def detect_rim_lines(image):
     )
 
     if detected is None:
-        return None, roi_edges
+        return [], [], [], gray, roi_edges
 
-    lines = np.asarray(
-        detected,
-        dtype=np.int32,
-    ).reshape(-1, 4)
+    segments = np.asarray(detected, dtype=np.int32).reshape(-1, 4)
 
     horizontal = []
     left = []
     right = []
 
-    for line in lines:
-        length, angle, cx, cy = line_info(line)
+    for segment in segments:
+        candidate = make_candidate(segment)
 
-        if length < MIN_LINE_LENGTH:
+        if candidate.length < MIN_LINE_LENGTH:
             continue
 
-        # ----------------------------------------------------
-        # BACK / FRONT 후보
-        # ----------------------------------------------------
+        angle = candidate.angle_deg
 
         if is_horizontal(angle):
-            # 토트 중앙 부근을 지나는 긴 수평선 위주로 사용한다.
-            if (
-                width * 0.10 <= cx <= width * 0.90
-                and cy >= roi_y0
-            ):
-                horizontal.append(
-                    (length, line.copy(), cy)
-                )
+            horizontal.append(candidate)
+        elif LEFT_MIN_DEG <= angle <= LEFT_MAX_DEG and candidate.center_x < width * 0.55:
+            left.append(candidate)
+        elif RIGHT_MIN_DEG <= angle <= RIGHT_MAX_DEG and candidate.center_x > width * 0.45:
+            right.append(candidate)
 
+    horizontal.sort(key=lambda item: item.length, reverse=True)
+    left.sort(key=lambda item: item.length, reverse=True)
+    right.sort(key=lambda item: item.length, reverse=True)
+
+    horizontal = horizontal[:MAX_HORIZONTAL_CANDIDATES]
+    left = left[:MAX_LEFT_CANDIDATES]
+    right = right[:MAX_RIGHT_CANDIDATES]
+
+    return horizontal, left, right, gray, roi_edges
+
+
+def polygon_area(corners: np.ndarray) -> float:
+    """4점 polygon의 면적을 계산한다."""
+    return abs(float(cv2.contourArea(corners.astype(np.float32))))
+
+
+def corners_inside_margin(corners: np.ndarray, width: int, height: int) -> bool:
+    """교점이 화면에서 지나치게 멀리 벗어나지 않는지 확인한다."""
+    margin_x = width * CORNER_MARGIN_RATIO
+    margin_y = height * CORNER_MARGIN_RATIO
+
+    x = corners[:, 0]
+    y = corners[:, 1]
+
+    return bool(
+        np.all(x >= -margin_x)
+        and np.all(x <= width + margin_x)
+        and np.all(y >= -margin_y)
+        and np.all(y <= height + margin_y)
+    )
+
+
+def geometry_score(corners: np.ndarray, width: int, height: int) -> float | None:
+    """TL, TR, BR, BL이 정상적인 토트 사다리꼴인지 검사한다."""
+    tl, tr, br, bl = corners
+
+    if not corners_inside_margin(corners, width, height):
+        return None
+
+    if not (tl[0] < tr[0] and bl[0] < br[0]):
+        return None
+
+    if not (tl[1] < bl[1] and tr[1] < br[1]):
+        return None
+
+    back_width = float(np.linalg.norm(tr - tl))
+    front_width = float(np.linalg.norm(br - bl))
+    left_height = float(np.linalg.norm(bl - tl))
+    right_height = float(np.linalg.norm(br - tr))
+    mean_height = 0.5 * (left_height + right_height)
+
+    if mean_height < height * MIN_OPENING_HEIGHT_RATIO:
+        return None
+
+    if min(back_width, front_width) < width * MIN_OPENING_WIDTH_RATIO:
+        return None
+
+    width_ratio = back_width / max(front_width, 1e-6)
+
+    if not MIN_BACK_FRONT_WIDTH_RATIO <= width_ratio <= MAX_BACK_FRONT_WIDTH_RATIO:
+        return None
+
+    # 원근상 위쪽 모서리는 아래쪽 모서리보다 안쪽으로 들어오는 형태를 기대한다.
+    if tl[0] < bl[0] - width * 0.05:
+        return None
+
+    if tr[0] > br[0] + width * 0.05:
+        return None
+
+    area = polygon_area(corners)
+
+    if area < width * height * MIN_AREA_RATIO:
+        return None
+
+    height_ratio = min(left_height, right_height) / max(left_height, right_height, 1e-6)
+
+    if height_ratio < 0.45:
+        return None
+
+    area_score = min(1.0, area / (width * height * 0.55))
+    symmetry_score = height_ratio
+    perspective_score = 1.0 - min(abs(width_ratio - 0.85), 0.85) / 0.85
+
+    return 0.45 * area_score + 0.30 * symmetry_score + 0.25 * perspective_score
+
+
+def polygon_dark_fraction(gray: np.ndarray, corners: np.ndarray) -> float:
+    """사다리꼴 내부가 얼마나 어두운지 계산한다."""
+    mask = np.zeros_like(gray, dtype=np.uint8)
+    polygon = np.rint(corners).astype(np.int32)
+
+    cv2.fillConvexPoly(mask, polygon, 255)
+
+    # rim 자체보다 실제 opening 내부를 보기 위해 mask를 조금 줄인다.
+    kernel = np.ones((15, 15), dtype=np.uint8)
+    inner_mask = cv2.erode(mask, kernel, iterations=1)
+
+    pixels = gray[inner_mask > 0]
+
+    if pixels.size == 0:
+        return 0.0
+
+    return float(np.mean(pixels < DARK_THRESHOLD))
+
+
+def segment_edge_support(edges: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    """두 corner 사이에 실제 edge가 얼마나 이어져 있는지 계산한다."""
+    height, width = edges.shape
+
+    xs = np.linspace(start[0], end[0], EDGE_SAMPLE_COUNT)
+    ys = np.linspace(start[1], end[1], EDGE_SAMPLE_COUNT)
+
+    supported = 0
+    valid = 0
+
+    for x_value, y_value in zip(xs, ys):
+        x = int(round(x_value))
+        y = int(round(y_value))
+
+        if not (0 <= x < width and 0 <= y < height):
             continue
 
-        # ----------------------------------------------------
-        # LEFT 후보
-        # ----------------------------------------------------
+        x0 = max(0, x - EDGE_SEARCH_RADIUS)
+        x1 = min(width, x + EDGE_SEARCH_RADIUS + 1)
+        y0 = max(0, y - EDGE_SEARCH_RADIUS)
+        y1 = min(height, y + EDGE_SEARCH_RADIUS + 1)
 
-        if (
-            LEFT_MIN_DEG <= angle <= LEFT_MAX_DEG
-            and cx < width * 0.48
-        ):
-            left.append(
-                (length, line.copy())
-            )
+        patch = edges[y0:y1, x0:x1]
 
-            continue
+        valid += 1
 
-        # ----------------------------------------------------
-        # RIGHT 후보
-        # ----------------------------------------------------
+        if np.any(patch > 0):
+            supported += 1
 
-        if (
-            RIGHT_MIN_DEG <= angle < RIGHT_MAX_DEG
-            and cx > width * 0.52
-        ):
-            right.append(
-                (length, line.copy())
-            )
+    if valid == 0:
+        return 0.0
 
-    back_group, front_group = split_horizontal_groups(
-        horizontal,
-        width,
-    )
+    return supported / valid
 
-    # horizontal group 형식을 fit 함수 형태로 맞춘다.
-    back_fit_input = [
-        (length, line)
-        for length, line, _ in back_group
+
+def trapezoid_edge_support(edges: np.ndarray, corners: np.ndarray) -> float:
+    """BACK / RIGHT / FRONT / LEFT 네 변의 평균 edge support를 계산한다."""
+    tl, tr, br, bl = corners
+
+    supports = [
+        segment_edge_support(edges, tl, tr),
+        segment_edge_support(edges, tr, br),
+        segment_edge_support(edges, br, bl),
+        segment_edge_support(edges, bl, tl),
     ]
 
-    front_fit_input = [
-        (length, line)
-        for length, line, _ in front_group
-    ]
-
-    back_line = fit_representative_line(
-        back_fit_input,
-    )
-
-    front_line = fit_representative_line(
-        front_fit_input,
-    )
-
-    left_line = fit_representative_line(
-        left,
-    )
-
-    right_line = fit_representative_line(
-        right,
-    )
-
-    result = {
-        "back": back_line,
-        "front": front_line,
-        "left": left_line,
-        "right": right_line,
-        "roi": (
-            roi_x0,
-            roi_y0,
-            roi_x1 - roi_x0,
-            roi_y1 - roi_y0,
-        ),
-    }
-
-    return result, roi_edges
+    return float(np.mean(supports))
 
 
-def draw_result(image, result):
-    """최종 대표 4개 직선만 영상에 표시한다."""
+def make_corners(
+    back: LineCandidate,
+    front: LineCandidate,
+    left: LineCandidate,
+    right: LineCandidate,
+) -> np.ndarray | None:
+    """네 직선의 교점으로 TL, TR, BR, BL을 만든다."""
+    tl = intersection(back.line_abc, left.line_abc)
+    tr = intersection(back.line_abc, right.line_abc)
+    bl = intersection(front.line_abc, left.line_abc)
+    br = intersection(front.line_abc, right.line_abc)
+
+    if any(point is None for point in (tl, tr, br, bl)):
+        return None
+
+    return np.stack((tl, tr, br, bl), axis=0)
+
+
+def find_best_tote(image: np.ndarray) -> tuple[ToteDetection | None, np.ndarray]:
+    """모든 후보선 조합 중 가장 그럴듯한 토트 opening 하나를 선택한다."""
+    horizontal, left_candidates, right_candidates, gray, edges = detect_line_candidates(image)
+
+    height, width = image.shape[:2]
+    best_detection = None
+
+    for first_index in range(len(horizontal)):
+        for second_index in range(first_index + 1, len(horizontal)):
+            first = horizontal[first_index]
+            second = horizontal[second_index]
+
+            back, front = (first, second) if first.center_y <= second.center_y else (second, first)
+
+            # 같은 rim의 안쪽/바깥쪽 edge를 BACK과 FRONT로 동시에 선택하지 못하게 한다.
+            if front.center_y - back.center_y < height * MIN_OPENING_HEIGHT_RATIO:
+                continue
+
+            for left in left_candidates:
+                for right in right_candidates:
+                    corners = make_corners(back, front, left, right)
+
+                    if corners is None:
+                        continue
+
+                    geo_score = geometry_score(corners, width, height)
+
+                    if geo_score is None:
+                        continue
+
+                    dark_fraction = polygon_dark_fraction(gray, corners)
+
+                    if dark_fraction < MIN_DARK_FRACTION:
+                        continue
+
+                    edge_support = trapezoid_edge_support(edges, corners)
+
+                    if edge_support < 0.35:
+                        continue
+
+                    total_score = 0.35 * geo_score + 0.35 * dark_fraction + 0.30 * edge_support
+
+                    if best_detection is None or total_score > best_detection.score:
+                        best_detection = ToteDetection(
+                            corners=corners,
+                            score=total_score,
+                            dark_fraction=dark_fraction,
+                            edge_support=edge_support,
+                        )
+
+    return best_detection, edges
+
+
+def draw_detection(image: np.ndarray, detection: ToteDetection | None) -> np.ndarray:
+    """최종 토트 opening과 TL/TR/BR/BL corner를 영상에 표시한다."""
     output = image.copy()
 
-    if result is None:
-        cv2.putText(
-            output,
-            "NO RIM LINES",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
+    if detection is None:
+        cv2.putText(output, "TOTE NOT FOUND", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
         return output
 
-    roi = result["roi"]
+    corners = np.rint(detection.corners).astype(np.int32)
+    tl, tr, br, bl = corners
 
-    # ROI는 얇은 회색 사각형으로만 표시한다.
-    x, y, width, height = roi
+    cv2.line(output, tuple(tl), tuple(tr), (0, 255, 255), 4, cv2.LINE_AA)
+    cv2.line(output, tuple(tr), tuple(br), (255, 255, 0), 4, cv2.LINE_AA)
+    cv2.line(output, tuple(bl), tuple(br), (255, 0, 255), 4, cv2.LINE_AA)
+    cv2.line(output, tuple(tl), tuple(bl), (0, 255, 0), 4, cv2.LINE_AA)
 
-    cv2.rectangle(
-        output,
-        (x, y),
-        (x + width, y + height),
-        (150, 150, 150),
-        1,
-    )
+    for name, point in zip(("TL", "TR", "BR", "BL"), corners):
+        point_tuple = (int(point[0]), int(point[1]))
 
-    line_styles = {
-        "back": ((0, 255, 255), "BACK"),
-        "front": ((255, 0, 255), "FRONT"),
-        "left": ((0, 255, 0), "LEFT"),
-        "right": ((255, 255, 0), "RIGHT"),
-    }
+        cv2.circle(output, point_tuple, 7, (0, 0, 255), -1)
+        cv2.putText(output, name, (point_tuple[0] + 8, point_tuple[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
-    found_count = 0
+    center = np.mean(detection.corners, axis=0)
+    center_point = (int(round(center[0])), int(round(center[1])))
 
-    for name in (
-        "back",
-        "front",
-        "left",
-        "right",
-    ):
-        fitted = result[name]
+    cv2.circle(output, center_point, 8, (255, 255, 255), -1)
+    cv2.putText(output, "TOTE FOUND", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
 
-        if fitted is None:
-            continue
-
-        clipped = clip_fitted_line(
-            fitted,
-            roi,
-        )
-
-        if clipped is None:
-            continue
-
-        color, label = line_styles[name]
-        p1, p2 = clipped
-
-        cv2.line(
-            output,
-            p1,
-            p2,
-            color,
-            4,
-            cv2.LINE_AA,
-        )
-
-        angle = fitted_line_angle_deg(
-            fitted,
-        )
-
-        text_x = int(
-            0.5 * (p1[0] + p2[0])
-        )
-
-        text_y = int(
-            0.5 * (p1[1] + p2[1])
-        )
-
-        cv2.putText(
-            output,
-            f"{label} {angle:.1f}",
-            (text_x, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
-
-        found_count += 1
-
-    status_color = (
-        (0, 255, 0)
-        if found_count == 4
-        else (0, 0, 255)
-    )
-
-    cv2.putText(
-        output,
-        f"RIM LINES: {found_count}/4",
-        (20, 35),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.75,
-        status_color,
-        2,
-        cv2.LINE_AA,
-    )
+    score_text = f"score={detection.score:.3f}  dark={detection.dark_fraction:.2f}  edge={detection.edge_support:.2f}"
+    cv2.putText(output, score_text, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
 
     return output
 
 
-def start_camera(serial):
-    """D435 RGB 스트림만 시작한다."""
+def start_camera(serial: str | None):
+    """D435 RGB 스트림을 시작한다."""
     pipeline = rs.pipeline()
     config = rs.config()
 
     if serial:
         config.enable_device(serial)
 
-    config.enable_stream(
-        rs.stream.color,
-        CAM_WIDTH,
-        CAM_HEIGHT,
-        rs.format.bgr8,
-        CAM_FPS,
-    )
+    config.enable_stream(rs.stream.color, CAM_WIDTH, CAM_HEIGHT, rs.format.bgr8, CAM_FPS)
+    profile = pipeline.start(config)
 
-    profile = pipeline.start(
-        config,
-    )
-
-    # 자동 노출 등이 안정될 시간을 준다.
     for _ in range(30):
         pipeline.wait_for_frames()
 
     device = profile.get_device()
 
     try:
-        camera_serial = device.get_info(
-            rs.camera_info.serial_number
-        )
+        camera_serial = device.get_info(rs.camera_info.serial_number)
     except Exception:
         camera_serial = "unknown"
 
-    print(
-        f"D435 RGB 시작: serial={camera_serial}"
-    )
-
-    print(
-        f"resolution={CAM_WIDTH}x{CAM_HEIGHT}@{CAM_FPS}"
-    )
+    print(f"D435 RGB 시작: serial={camera_serial}")
+    print(f"resolution={CAM_WIDTH}x{CAM_HEIGHT}@{CAM_FPS}")
 
     return pipeline
 
 
 def main():
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--serial",
-        default=None,
-        help="사용할 D435 serial",
-    )
-
+    parser.add_argument("--serial", default=None, help="사용할 D435 serial")
     args = parser.parse_args()
 
-    pipeline = start_camera(
-        args.serial,
-    )
+    pipeline = start_camera(args.serial)
 
     print("q 또는 ESC: 종료")
     print("s: 현재 결과 저장")
@@ -589,50 +539,24 @@ def main():
             if not color_frame:
                 continue
 
-            image = np.asarray(
-                color_frame.get_data()
-            )
+            image = np.asarray(color_frame.get_data())
+            detection, edges = find_best_tote(image)
+            result = draw_detection(image, detection)
 
-            result, _ = detect_rim_lines(
-                image,
-            )
-
-            visualized = draw_result(
-                image,
-                result,
-            )
-
-            cv2.imshow(
-                "Tote 4 Rim Lines",
-                visualized,
-            )
+            cv2.imshow("Tote Opening", result)
+            cv2.imshow("Edges", edges)
 
             key = cv2.waitKey(1) & 0xFF
 
-            if key in (
-                27,
-                ord("q"),
-                ord("Q"),
-            ):
+            if key in (27, ord("q"), ord("Q")):
                 break
 
-            if key in (
-                ord("s"),
-                ord("S"),
-            ):
-                cv2.imwrite(
-                    "tote_4_rim_lines.png",
-                    visualized,
-                )
+            if key in (ord("s"), ord("S")):
+                cv2.imwrite("tote_rgb.png", image)
+                cv2.imwrite("tote_detection.png", result)
+                cv2.imwrite("tote_edges.png", edges)
 
-                cv2.imwrite(
-                    "tote_rgb.png",
-                    image,
-                )
-
-                print(
-                    "tote_4_rim_lines.png / tote_rgb.png 저장"
-                )
+                print("tote_rgb.png / tote_detection.png / tote_edges.png 저장")
 
     finally:
         pipeline.stop()
