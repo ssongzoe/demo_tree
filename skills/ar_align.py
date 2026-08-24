@@ -27,7 +27,7 @@ CAM_HEIGHT = 480
 CAM_FPS = 15
 
 # OpenCV 카메라 좌표계: +x 오른쪽, +y 아래쪽, +z 전방
-TARGET_MARKER_POS = (0.0, 0.0, 0.28)
+TARGET_MARKER_POS = (0.0, 0.0, 0.30)
 
 MIN_TURN_DEG = 2.0
 POSITION_TOL = 0.01
@@ -154,18 +154,18 @@ def align_to_marker(
 
         time.sleep(SETTLE_S)
 
-        # 최종 위치를 한 번 더 확인한다.
-        final_position, final_yaw_deg = measure_marker(camera, detector, marker_id, pnp_size)
+        # # 최종 위치를 한 번 더 확인한다.
+        # final_position, final_yaw_deg = measure_marker(camera, detector, marker_id, pnp_size)
 
-        if final_position is not None:
-            final_error = np.asarray(final_position, dtype=float) - np.asarray(target_marker_pos, dtype=float)
+        # if final_position is not None:
+        #     final_error = np.asarray(final_position, dtype=float) - np.asarray(target_marker_pos, dtype=float)
 
-            print(
-                f"정렬 완료: forward={final_error[2]:+.3f} m, lateral={-final_error[0]:+.3f} m, "
-                f"yaw={final_yaw_deg:+.2f} deg"
-            )
-        else:
-            print("정렬 이동은 완료했지만 최종 마커 측정은 실패했습니다.")
+        #     print(
+        #         f"정렬 완료: forward={final_error[2]:+.3f} m, lateral={-final_error[0]:+.3f} m, "
+        #         f"yaw={final_yaw_deg:+.2f} deg"
+        #     )
+        # else:
+        #     print("정렬 이동은 완료했지만 최종 마커 측정은 실패했습니다.")
 
         return True
 
