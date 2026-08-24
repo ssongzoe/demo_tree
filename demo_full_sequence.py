@@ -22,6 +22,7 @@ from control.mobile_controller import (
     odom_pose,
     wait_for_odometry,
 )
+from control.robot_controller  import move_to_ready_pose
 from demo_grasp import (
     BEFORE_GRASP_LEFT,
     BEFORE_GRASP_RIGHT,
@@ -256,6 +257,9 @@ def main() -> None:
 
         if not prepare_robot(robot):
             raise RuntimeError("로봇 제어 준비 실패")
+
+        move_to_ready_pose()
+
 
         robot.set_tool_flange_output_voltage("right", 12)
         robot.set_tool_flange_output_voltage("left", 12)
