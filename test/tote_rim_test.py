@@ -88,11 +88,11 @@ def draw_lines(image, lines):
         )
         return output
 
+    lines = np.asarray(lines, dtype=np.int32).reshape(-1,4)
+
     candidates = []
 
-    for detected in lines:
-        line = detected[0]
-
+    for line in lines:
         length, angle = line_info(line)
 
         candidates.append(
