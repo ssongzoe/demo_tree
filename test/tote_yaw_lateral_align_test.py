@@ -122,6 +122,8 @@ EDGE_SEARCH_RADIUS = 4
 MIN_TOP_EDGE_SUPPORT = 0.55
 MIN_SIDE_EDGE_SUPPORT = 0.35
 
+TARGET_TOP_WIDTH_PX = 507.5
+TOP_WIDTH_TOL_PX = 15.0
 
 # ============================================================
 # 여러 frame 측정
@@ -656,6 +658,14 @@ def measure_fine(pipeline: rs.pipeline, title: str) -> FineMeasurement | None:
         center_y_std_px=float(np.std(center_ys)),
         valid_frames=len(filtered),
     )
+
+    if abs(measurement.top_width_px - TARGET_TOP_WIDTH_PX) > TOP_WIDTH_TOL_PX:
+        print(
+            f"FINE width 이상: current={measurement.top_width_px:.2f} px, "
+            f"target={TARGET_TOP_WIDTH_PX:.2f} px"
+        )
+        return None
+
 
     print(
         f"FINE 측정 | angle={measurement.angle_deg:+.3f} deg | cx={measurement.center_x_px:.2f} px | "
