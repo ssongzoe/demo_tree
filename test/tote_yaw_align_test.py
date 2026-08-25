@@ -14,16 +14,16 @@
 python test/tote_yaw_align_test.py --serial 250122079439
 """
 
-from __future__ import annotations
-
 import argparse
 from dataclasses import dataclass
 import math
-import time
+import time, Path
 
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 
