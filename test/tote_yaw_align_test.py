@@ -1,34 +1,40 @@
 #!/usr/bin/env python3
-"""D435 TOP rim을 이용해 RB-Y1 base yaw만 정렬하는 테스트.
+"""D435 TOP rim을 이용해 RB-Y1 base yaw를 한 번에 정렬하는 테스트.
 
 동작
 1. TOP rim을 여러 frame 측정한다.
 2. median angle을 계산한다.
-3. 목표 angle과 비교한다.
-4. 한 번에 최대 2도만 base를 회전한다.
-5. 다시 측정하며 반복한다.
-
-이번 테스트에서는 x / y 이동은 하지 않는다.
+3. 계산된 yaw 보정량만큼 base를 한 번에 회전한다.
+4. 회전 후 TOP rim을 다시 측정해 결과만 검증한다.
+5. 검증 결과로 추가 이동하지 않는다.
 
 사용법:
 python test/tote_yaw_align_test.py --serial 250122079439
 """
 
+from __future__ import annotations
+
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 import math
 import sys
 import time
-from pathlib import Path
 
 import cv2
 import numpy as np
 import pyrealsense2 as rs
 
+
+# ============================================================
+# 프로젝트 import 경로
+# ============================================================
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
 
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 
@@ -50,21 +56,23 @@ MIN_LEG_TIME = 1.5
 # Yaw 정렬
 # ============================================================
 
-# 최근 정상 위치에서 TOP이 거의 0도였으므로 우선 0도를 목표로 사용한다.
+# 정렬이 완료된 기준 자세에서 TOP rim이 영상상 거의 0도이므로 0도를 목표로 사용한다.
 TARGET_ANGLE_DEG = 0.0
 
-# Hough 각도가 0도와 약 -0.9도 사이에서 움직였으므로 너무 작은 tolerance는 사용하지 않는다.
+# 처음부터 목표 범위 안이면 base를 움직이지 않는다.
 ANGLE_TOL_DEG = 0.8
 
-# 영상 angle 1도 변화에 base yaw가 대략 1도보다 크게 필요했으므로 보수적으로 1.5배부터 시작한다.
-YAW_GAIN = 1.5
+# 실제 테스트에서 image angle 약 5.083도 보정에 base yaw 약 7.499도가 필요했다.
+YAW_GAIN = 1.475
 
-# 사용자 테스트에서 base +yaw → 영상 angle 감소였으므로 현재 error와 같은 부호로 회전한다.
+# image angle이 음수일 때 base는 양의 yaw 방향으로 돌아야 한다.
 YAW_SIGN = -1.0
 
-# 한 번에 큰 각도를 돌리지 않고 측정 → 이동 → 재측정을 반복한다.
-MAX_YAW_STEP_DEG = 2.0
-MAX_ITERATIONS = 6
+# odom 복귀 후 vision이 처리할 수 있는 최대 yaw 오차 범위를 제한한다.
+MAX_YAW_COMMAND_DEG = 10.0
+
+# 이동 후 검증에서 이 범위 안이면 SUCCESS로 판단한다.
+VERIFY_ANGLE_TOL_DEG = 0.8
 
 
 # ============================================================
@@ -92,18 +100,19 @@ MAX_LINE_GAP = 40
 
 MAX_TOP_ANGLE_DEG = 12.0
 
-# odom 복귀 후 가까운 위치에 있을 것을 전제로 TOP rim이 나타나는 세로 범위를 제한한다.
+# odom 복귀 후 테이블 앞 근처에 있다는 전제로 TOP rim이 나타나는 세로 영역을 제한한다.
 TOP_MIN_Y = 55
 TOP_MAX_Y = 175
 
-# TOP 아래쪽이 토트 내부이므로 위/아래 밝기 차이를 후보 선택에 사용한다.
+# TOP 바로 아래는 검은 토트 내부이므로 위/아래 밝기 차이를 후보 선택에 사용한다.
 CONTRAST_OFFSET_PX = 10
 CONTRAST_SAMPLE_COUNT = 20
 
+# 한 번의 측정에서 사용할 frame 수.
 MEASURE_FRAMES = 20
 MEASURE_TIMEOUT_S = 4.0
 
-# 여러 frame 측정 결과 자체가 불안정하면 로봇을 움직이지 않는다.
+# 여러 frame에서 측정값이 크게 흔들리면 잘못된 line으로 판단하고 base를 움직이지 않는다.
 MAX_ANGLE_STD_DEG = 1.0
 MAX_CENTER_Y_STD_PX = 4.0
 
@@ -144,7 +153,7 @@ def normalize_horizontal_angle_deg(angle_deg: float) -> float:
 
 
 def line_info(line: np.ndarray):
-    """Hough 선분의 길이, 각도, 중심점을 계산한다."""
+    """Hough 선분의 길이, 수평 기준 각도, 중심점을 계산한다."""
     x1, y1, x2, y2 = [float(value) for value in line]
 
     dx = x2 - x1
@@ -212,7 +221,7 @@ def sample_line_contrast(gray: np.ndarray, line: np.ndarray) -> float:
 
 
 def detect_top_rim(image: np.ndarray) -> tuple[TopFeature | None, np.ndarray]:
-    """수평선 후보 중 길이와 토트 내부 밝기 조건을 이용해 TOP rim 하나를 선택한다."""
+    """수평선 후보 중 길이와 TOP 아래쪽 밝기 조건을 이용해 가장 좋은 rim 하나를 선택한다."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -252,7 +261,6 @@ def detect_top_rim(image: np.ndarray) -> tuple[TopFeature | None, np.ndarray]:
 
         contrast = sample_line_contrast(gray, line)
 
-        # 긴 선을 우선하되, 바로 아래가 더 어두운 토트 TOP 특성을 추가로 사용한다.
         length_score = length / CAM_WIDTH
         contrast_score = np.clip(contrast / 80.0, -1.0, 1.0)
         score = 0.70 * length_score + 0.30 * contrast_score
@@ -261,15 +269,10 @@ def detect_top_rim(image: np.ndarray) -> tuple[TopFeature | None, np.ndarray]:
             continue
 
         x1, y1, x2, y2 = [int(value) for value in line]
-
-        if x1 <= x2:
-            p1 = (x1, y1)
-            p2 = (x2, y2)
-        else:
-            p1 = (x2, y2)
-            p2 = (x1, y1)
+        p1, p2 = ((x1, y1), (x2, y2)) if x1 <= x2 else ((x2, y2), (x1, y1))
 
         best_score = score
+
         best_feature = TopFeature(
             angle_deg=angle_deg,
             center_x_px=center_x,
@@ -283,7 +286,7 @@ def detect_top_rim(image: np.ndarray) -> tuple[TopFeature | None, np.ndarray]:
     return best_feature, roi_edges
 
 
-def draw_feature(image: np.ndarray, feature: TopFeature | None, iteration: int) -> np.ndarray:
+def draw_feature(image: np.ndarray, feature: TopFeature | None, title: str) -> np.ndarray:
     """현재 TOP 검출 결과를 화면에 표시한다."""
     output = image.copy()
 
@@ -300,17 +303,17 @@ def draw_feature(image: np.ndarray, feature: TopFeature | None, iteration: int) 
     cv2.circle(output, center, 7, (0, 0, 255), -1)
 
     text = (
-        f"iter={iteration}  angle={feature.angle_deg:+.2f} deg  "
+        f"{title}  angle={feature.angle_deg:+.2f} deg  cx={feature.center_x_px:.1f}  "
         f"cy={feature.center_y_px:.1f}  contrast={feature.contrast:+.1f}"
     )
 
-    cv2.putText(output, text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(output, text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 2, cv2.LINE_AA)
 
     return output
 
 
-def measure_top(pipeline: rs.pipeline, iteration: int) -> TopMeasurement | None:
-    """여러 frame의 TOP 결과를 모아 median 측정값을 계산한다."""
+def measure_top(pipeline: rs.pipeline, title: str) -> TopMeasurement | None:
+    """여러 frame의 TOP 검출 결과를 모아서 median 측정값을 계산한다."""
     features = []
     start = time.monotonic()
 
@@ -324,7 +327,7 @@ def measure_top(pipeline: rs.pipeline, iteration: int) -> TopMeasurement | None:
         image = np.asarray(color_frame.get_data())
         feature, _ = detect_top_rim(image)
 
-        cv2.imshow("Tote Yaw Align", draw_feature(image, feature, iteration))
+        cv2.imshow("Tote Yaw Align", draw_feature(image, feature, title))
         cv2.waitKey(1)
 
         if feature is not None:
@@ -337,7 +340,7 @@ def measure_top(pipeline: rs.pipeline, iteration: int) -> TopMeasurement | None:
     center_ys = np.asarray([feature.center_y_px for feature in features], dtype=np.float64)
     median_y = float(np.median(center_ys))
 
-    # 다른 수평선으로 순간 점프한 frame은 center_y 기준으로 한 번 제거한다.
+    # 순간적으로 다른 수평선을 잡은 frame은 center_y를 기준으로 제거한다.
     filtered = [feature for feature in features if abs(feature.center_y_px - median_y) <= 5.0]
 
     if len(filtered) < MEASURE_FRAMES // 2:
@@ -375,18 +378,18 @@ def measure_top(pipeline: rs.pipeline, iteration: int) -> TopMeasurement | None:
 
 
 def flush_camera(pipeline: rs.pipeline, frames: int = CAMERA_FLUSH_FRAMES) -> None:
-    """로봇 이동 중 쌓인 이전 frame을 버린다."""
+    """로봇 이동 중 카메라에 쌓인 이전 frame을 버린다."""
     for _ in range(frames):
         pipeline.wait_for_frames()
 
 
 def turn_duration(angle_rad: float) -> float:
-    """기존 모바일 trajectory와 동일한 방식으로 작은 yaw 이동 시간을 계산한다."""
+    """작은 yaw 이동에 필요한 trajectory 시간을 계산한다."""
     return max(QUINTIC_PEAK * abs(angle_rad) / ALIGN_ANGULAR_SPEED, MIN_LEG_TIME)
 
 
 def move_relative_yaw(robot, monitor: OdometryMonitor, angle_deg: float) -> bool:
-    """현재 base 자세를 기준으로 yaw만 상대 이동한다."""
+    """현재 odom 자세를 기준으로 yaw만 상대 이동한다."""
     angle_rad = math.radians(angle_deg)
 
     leg = build_leg(
@@ -424,47 +427,64 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
 
 
-def align_yaw(robot, monitor: OdometryMonitor, pipeline: rs.pipeline) -> bool:
-    """TOP rim angle만 이용해 base yaw를 반복 보정한다."""
-    previous_error = None
+def align_yaw_once(robot, monitor: OdometryMonitor, pipeline: rs.pipeline) -> bool:
+    """TOP rim을 한 번 측정하고 계산된 yaw를 한 번에 보정한 뒤 결과만 검증한다."""
+    print()
+    print("========== YAW ALIGN ==========")
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
-        print()
-        print(f"========== YAW ITERATION {iteration}/{MAX_ITERATIONS} ==========")
+    before = measure_top(pipeline, "BEFORE")
 
-        measurement = measure_top(pipeline, iteration)
+    if before is None:
+        return False
 
-        if measurement is None:
-            return False
+    error_deg = before.angle_deg - TARGET_ANGLE_DEG
 
-        error_deg = measurement.angle_deg - TARGET_ANGLE_DEG
+    print(
+        f"Yaw error: current={before.angle_deg:+.3f} deg, "
+        f"target={TARGET_ANGLE_DEG:+.3f} deg, error={error_deg:+.3f} deg"
+    )
 
-        print(f"Yaw error: current={measurement.angle_deg:+.3f} deg, target={TARGET_ANGLE_DEG:+.3f} deg, error={error_deg:+.3f} deg")
+    if abs(error_deg) <= ANGLE_TOL_DEG:
+        print("이미 Yaw 정렬 범위 안입니다.")
+        return True
 
-        if abs(error_deg) <= ANGLE_TOL_DEG:
-            print("Yaw 정렬 완료")
-            return True
+    correction_deg = YAW_SIGN * YAW_GAIN * error_deg
+    correction_deg = clamp(correction_deg, -MAX_YAW_COMMAND_DEG, MAX_YAW_COMMAND_DEG)
 
-        # 직전 이동 이후 오차가 크게 증가했다면 잘못된 선 또는 회전 부호 문제로 보고 중단한다.
-        if previous_error is not None and abs(error_deg) > abs(previous_error) + 0.8:
-            print("Yaw 오차가 오히려 증가했습니다. 검출 또는 YAW_SIGN을 확인하세요.")
-            return False
+    print(f"Yaw gain       : {YAW_GAIN:.3f}")
+    print(f"Base yaw command: {correction_deg:+.3f} deg")
 
-        correction_deg = YAW_SIGN * YAW_GAIN * error_deg
-        correction_deg = clamp(correction_deg, -MAX_YAW_STEP_DEG, MAX_YAW_STEP_DEG)
+    if not move_relative_yaw(robot, monitor, correction_deg):
+        print("Base yaw 이동 실패")
+        return False
 
-        print(f"Base yaw command: {correction_deg:+.3f} deg")
+    time.sleep(SETTLE_S)
+    flush_camera(pipeline)
 
-        if not move_relative_yaw(robot, monitor, correction_deg):
-            print("Base yaw 이동 실패")
-            return False
+    print()
+    print("========== YAW VERIFY ==========")
 
-        previous_error = error_deg
+    after = measure_top(pipeline, "AFTER")
 
-        time.sleep(SETTLE_S)
-        flush_camera(pipeline)
+    if after is None:
+        print("Yaw 이동은 완료했지만 최종 Vision 검증에 실패했습니다.")
+        return False
 
-    print("최대 반복 횟수 안에 yaw 정렬이 완료되지 않았습니다.")
+    final_error_deg = after.angle_deg - TARGET_ANGLE_DEG
+
+    print()
+    print(f"Before angle : {before.angle_deg:+.3f} deg")
+    print(f"Command      : {correction_deg:+.3f} deg")
+    print(f"After angle  : {after.angle_deg:+.3f} deg")
+    print(f"Final error  : {final_error_deg:+.3f} deg")
+
+    if abs(final_error_deg) <= VERIFY_ANGLE_TOL_DEG:
+        print("Yaw 1회 정렬 성공")
+        return True
+
+    print("Yaw 1회 이동은 완료했지만 최종 오차가 tolerance 밖입니다.")
+    print("추가 보정은 수행하지 않습니다.")
+
     return False
 
 
@@ -474,6 +494,7 @@ def main():
     args = parser.parse_args()
 
     pipeline = start_camera(args.serial)
+
     robot = initialize_mobile(address=ADDRESS, model="m")
     monitor = OdometryMonitor()
 
@@ -485,13 +506,14 @@ def main():
             return
 
         print()
-        print(f"TARGET_ANGLE_DEG = {TARGET_ANGLE_DEG:+.2f}")
-        print(f"ANGLE_TOL_DEG    = ±{ANGLE_TOL_DEG:.2f}")
-        print(f"MAX_YAW_STEP_DEG = {MAX_YAW_STEP_DEG:.2f}")
+        print(f"TARGET_ANGLE_DEG     = {TARGET_ANGLE_DEG:+.3f}")
+        print(f"ANGLE_TOL_DEG        = ±{ANGLE_TOL_DEG:.3f}")
+        print(f"YAW_GAIN             = {YAW_GAIN:.3f}")
+        print(f"MAX_YAW_COMMAND_DEG  = ±{MAX_YAW_COMMAND_DEG:.1f}")
         print()
-        print("Yaw 정렬 테스트 시작")
+        print("Yaw 1회 정렬 테스트 시작")
 
-        success = align_yaw(robot, monitor, pipeline)
+        success = align_yaw_once(robot, monitor, pipeline)
 
         print()
         print("RESULT:", "SUCCESS" if success else "FAILED")
