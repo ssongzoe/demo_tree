@@ -16,10 +16,10 @@ import rby1_sdk as rby
 
 
 READY_POSE = {
-    "torso": np.deg2rad([0.0, 30.0, -50.0, 45.0, 0.0, 0.0]).tolist(),
+    "torso": np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist(),
     "right_arm": np.deg2rad([-10.0, -40.0, -5.0, -110.0, -35.0, 50.0, 0.0]).tolist(),
     "left_arm": np.deg2rad([-10.0, 40.0, -5.0, -110.0, 35.0, 50.0, 0.0]).tolist(),
-    "head": np.deg2rad([0.0, 50.0]).tolist(),
+    "head": np.deg2rad([0.0, 43.0]).tolist(),
 }
 
 READY_MINIMUM_TIME = 2.0
