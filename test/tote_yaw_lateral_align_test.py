@@ -75,7 +75,7 @@ CAMERA_FLUSH_FRAMES = 10
 # ============================================================
 
 TARGET_ANGLE_DEG = 0.0
-ANGLE_TOL_DEG = 0.8
+ANGLE_TOL_DEG = 1.0
 
 # 실제 실험에서 image angle -4.965도에 base +7.324도가 거의 정확하게 맞았다.
 YAW_GAIN = 1.475
@@ -133,8 +133,8 @@ CONTRAST_SAMPLE_COUNT = 20
 TOP_MEASURE_FRAMES = 20
 TOP_MEASURE_TIMEOUT_S = 4.0
 
-MAX_TOP_ANGLE_STD_DEG = 1.0
-MAX_TOP_CENTER_Y_STD_PX = 4.0
+MAX_TOP_ANGLE_STD_DEG = 0.25
+MAX_TOP_CENTER_Y_STD_PX = 2.0
 
 
 # ============================================================
@@ -171,6 +171,8 @@ FINE_MEASURE_TIMEOUT_S = 5.0
 
 FINE_WIDTH_FILTER_PX = 10.0
 FINE_CENTER_Y_FILTER_PX = 5.0
+
+FINE_TOP_MAX_ANGLE_DEG = 1.0
 
 
 @dataclass
@@ -562,7 +564,7 @@ def detect_fine_candidates(image: np.ndarray):
         candidate = make_candidate(segment)
         signed_angle = normalize_horizontal_angle_deg(candidate.angle_deg)
 
-        if abs(signed_angle) <= TOP_MAX_ANGLE_DEG and candidate.center_y < height * TOP_MAX_Y_RATIO:
+        if abs(signed_angle) <= FINE_TOP_MAX_ANGLE_DEG and candidate.center_y < height * TOP_MAX_Y_RATIO:
             top_candidates.append(candidate)
         elif LEFT_MIN_ANGLE_DEG <= candidate.angle_deg <= LEFT_MAX_ANGLE_DEG and candidate.center_x < width * 0.65:
             left_candidates.append(candidate)
