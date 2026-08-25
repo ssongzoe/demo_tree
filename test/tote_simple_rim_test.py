@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""D435 RGB에서 토트의 TOP / LEFT / RIGHT rim을 검출하고 영상 feature를 측정한다.
+"""D435 RGB에서 토트의 TOP / LEFT / RIGHT rim을 검출한다.
 
-핵심
-- Depth는 사용하지 않는다.
-- TOP / LEFT / RIGHT 세 직선을 찾는다.
-- TL = TOP ∩ LEFT, TR = TOP ∩ RIGHT 교점을 계산한다.
-- center_x / center_y는 Hough endpoint가 아니라 TL/TR에서 계산한다.
-- angle_deg는 TOP rim의 수평 기준 각도다.
-- 로봇은 움직이지 않는다.
+FINE
+- TOP + LEFT + RIGHT가 모두 검출되면 TL/TR 교점을 사용한다.
+- center_x / center_y는 TL/TR의 중심으로 계산한다.
+
+COARSE
+- LEFT 또는 RIGHT가 화면 밖으로 나가 FINE 검출이 실패하면 TOP rim만 사용한다.
+- TOP rim의 대략적인 중심을 이용해 토트가 화면 왼쪽/오른쪽 어느 방향에 있는지 판단한다.
+
+현재 버전에서는 로봇을 움직이지 않는다.
 
 키
-- p: 최근 측정값 통계 출력
+- p: 최근 측정 통계
 - r: 측정값 초기화
 - s: 현재 화면 저장
 - q / ESC: 종료
@@ -53,50 +55,58 @@ MAX_LINE_GAP = 40
 
 
 # ============================================================
-# 후보선 영역 / 각도
+# 후보선
 # ============================================================
 
-# TOP은 화면 위쪽 절반에서 찾는다.
 TOP_MAX_Y_RATIO = 0.50
 TOP_MAX_ANGLE_DEG = 12.0
 
-# LEFT / RIGHT는 토트 측면의 대각선 방향을 이용한다.
 LEFT_MIN_ANGLE_DEG = 90.0
 LEFT_MAX_ANGLE_DEG = 145.0
 
 RIGHT_MIN_ANGLE_DEG = 35.0
 RIGHT_MAX_ANGLE_DEG = 90.0
 
-MAX_TOP_CANDIDATES = 12
-MAX_LEFT_CANDIDATES = 8
-MAX_RIGHT_CANDIDATES = 8
+MAX_TOP_CANDIDATES = 6
+MAX_LEFT_CANDIDATES = 4
+MAX_RIGHT_CANDIDATES = 4
 
 
 # ============================================================
-# TOP + LEFT + RIGHT 조합 검사
+# FINE 검출 조건
 # ============================================================
 
 MIN_TOP_WIDTH_RATIO = 0.45
 MAX_TOP_WIDTH_RATIO = 1.10
-CORNER_MARGIN_RATIO = 0.06
 
-# TOP 아래쪽으로 이만큼 내려간 위치에서 좌우 측면이 벌어지는지 검사한다.
+CORNER_MARGIN_RATIO = 0.06
 SIDE_PROBE_HEIGHT_RATIO = 0.30
 
-# 검출된 세 직선 위에 실제 Canny edge가 어느 정도 존재해야 하는지 검사한다.
-EDGE_SAMPLE_COUNT = 60
+EDGE_SAMPLE_COUNT = 40
 EDGE_SEARCH_RADIUS = 4
 
 MIN_TOP_EDGE_SUPPORT = 0.55
 MIN_SIDE_EDGE_SUPPORT = 0.35
 
-# TOP 아래 영역이 실제 검은 토트 내부인지 확인하는 보조 조건이다.
 DARK_THRESHOLD = 110
 MIN_DARK_FRACTION = 0.45
 
 
 # ============================================================
-# 출력 / 통계
+# COARSE 검출 조건
+# ============================================================
+
+# 가장 긴 TOP 후보 주변에 있는 비슷한 Hough line들을 하나의 rim으로 묶는다.
+COARSE_TOP_Y_TOL_PX = 12.0
+COARSE_TOP_ANGLE_TOL_DEG = 3.0
+
+# 나중에 로봇 복귀 제어에 사용할 안전 영역이다. 현재는 화면에만 표시한다.
+COARSE_CENTER_LEFT_PX = 280.0
+COARSE_CENTER_RIGHT_PX = 380.0
+
+
+# ============================================================
+# 출력
 # ============================================================
 
 HISTORY_SIZE = 60
@@ -105,7 +115,7 @@ PRINT_EVERY_N_FRAMES = 5
 
 @dataclass
 class LineCandidate:
-    """Hough 선분 하나를 무한 직선으로 표현한다."""
+    """Hough 선분 하나와 무한 직선 표현."""
 
     segment: np.ndarray
     length: float
@@ -117,20 +127,25 @@ class LineCandidate:
 
 @dataclass
 class ToteFeature:
-    """TOP / LEFT / RIGHT 교점에서 계산한 토트 영상 feature."""
+    """토트 영상 feature."""
 
+    mode: str
     angle_deg: float
     center_x_px: float
     center_y_px: float
-    tl: np.ndarray
-    tr: np.ndarray
-    left_probe: np.ndarray
-    right_probe: np.ndarray
     score: float
+
+    top_p1: np.ndarray
+    top_p2: np.ndarray
+
+    tl: np.ndarray | None = None
+    tr: np.ndarray | None = None
+    left_probe: np.ndarray | None = None
+    right_probe: np.ndarray | None = None
 
 
 def normalize_horizontal_angle_deg(angle_deg: float) -> float:
-    """line angle을 수평 기준 -90~90 deg 범위로 변환한다."""
+    """line angle을 수평 기준 -90~90도 범위로 변환한다."""
     angle = (float(angle_deg) + 180.0) % 180.0
 
     if angle >= 90.0:
@@ -139,8 +154,13 @@ def normalize_horizontal_angle_deg(angle_deg: float) -> float:
     return angle
 
 
+def angle_difference_deg(first: float, second: float) -> float:
+    """수평선 방향 두 개의 최소 각도 차이를 계산한다."""
+    return abs(normalize_horizontal_angle_deg(first - second))
+
+
 def line_info(segment: np.ndarray):
-    """Hough 선분의 길이, 0~180도 각도, 중심점을 계산한다."""
+    """Hough 선분의 길이, 각도, 중심점을 계산한다."""
     x1, y1, x2, y2 = [float(value) for value in segment]
 
     dx = x2 - x1
@@ -155,7 +175,7 @@ def line_info(segment: np.ndarray):
 
 
 def segment_to_line(segment: np.ndarray) -> np.ndarray:
-    """두 점을 ax + by + c = 0 형태의 정규화된 무한 직선으로 변환한다."""
+    """두 점을 ax + by + c = 0 형태의 무한 직선으로 변환한다."""
     x1, y1, x2, y2 = [float(value) for value in segment]
 
     a = y1 - y2
@@ -190,7 +210,7 @@ def line_intersection(first: np.ndarray, second: np.ndarray) -> np.ndarray | Non
 
 
 def line_x_at_y(line_abc: np.ndarray, y: float) -> float | None:
-    """ax + by + c = 0 직선에서 주어진 y 위치의 x를 계산한다."""
+    """ax + by + c = 0 직선에서 지정 y의 x를 계산한다."""
     a, b, c = line_abc
 
     if abs(a) < 1e-8:
@@ -204,8 +224,16 @@ def line_x_at_y(line_abc: np.ndarray, y: float) -> float | None:
     return float(x)
 
 
+def fitted_y_at_x(vx: float, vy: float, x0: float, y0: float, x: float) -> float:
+    """cv2.fitLine 직선에서 지정 x 위치의 y를 계산한다."""
+    if abs(vx) < 1e-8:
+        return float(y0)
+
+    return float(y0 + (x - x0) * vy / vx)
+
+
 def make_candidate(segment: np.ndarray) -> LineCandidate:
-    """Hough 선분을 LineCandidate로 변환한다."""
+    """Hough 선분을 후보 객체로 변환한다."""
     length, angle_deg, center_x, center_y = line_info(segment)
 
     return LineCandidate(
@@ -219,9 +247,8 @@ def make_candidate(segment: np.ndarray) -> LineCandidate:
 
 
 def is_top_angle(angle_deg: float) -> bool:
-    """0도 또는 180도 근처의 수평선을 TOP 후보로 사용한다."""
-    signed = normalize_horizontal_angle_deg(angle_deg)
-    return abs(signed) <= TOP_MAX_ANGLE_DEG
+    """수평에 가까운 선인지 검사한다."""
+    return abs(normalize_horizontal_angle_deg(angle_deg)) <= TOP_MAX_ANGLE_DEG
 
 
 def detect_line_candidates(image: np.ndarray):
@@ -264,11 +291,11 @@ def detect_line_candidates(image: np.ndarray):
             top_candidates.append(candidate)
             continue
 
-        if LEFT_MIN_ANGLE_DEG <= candidate.angle_deg <= LEFT_MAX_ANGLE_DEG and candidate.center_x < width * 0.55:
+        if LEFT_MIN_ANGLE_DEG <= candidate.angle_deg <= LEFT_MAX_ANGLE_DEG and candidate.center_x < width * 0.65:
             left_candidates.append(candidate)
             continue
 
-        if RIGHT_MIN_ANGLE_DEG <= candidate.angle_deg <= RIGHT_MAX_ANGLE_DEG and candidate.center_x > width * 0.45:
+        if RIGHT_MIN_ANGLE_DEG <= candidate.angle_deg <= RIGHT_MAX_ANGLE_DEG and candidate.center_x > width * 0.35:
             right_candidates.append(candidate)
 
     top_candidates.sort(key=lambda item: item.length, reverse=True)
@@ -289,14 +316,11 @@ def point_inside_margin(point: np.ndarray, width: int, height: int) -> bool:
     margin_x = width * CORNER_MARGIN_RATIO
     margin_y = height * CORNER_MARGIN_RATIO
 
-    return bool(
-        -margin_x <= point[0] <= width + margin_x
-        and -margin_y <= point[1] <= height + margin_y
-    )
+    return bool(-margin_x <= point[0] <= width + margin_x and -margin_y <= point[1] <= height + margin_y)
 
 
 def segment_edge_support(edges: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
-    """두 점 사이의 예상 직선 주변에 실제 Canny edge가 얼마나 존재하는지 계산한다."""
+    """예상 직선 주변에 실제 Canny edge가 얼마나 존재하는지 계산한다."""
     height, width = edges.shape
 
     xs = np.linspace(start[0], end[0], EDGE_SAMPLE_COUNT)
@@ -329,7 +353,7 @@ def segment_edge_support(edges: np.ndarray, start: np.ndarray, end: np.ndarray) 
 
 
 def dark_fraction(gray: np.ndarray, tl: np.ndarray, tr: np.ndarray, left_probe: np.ndarray, right_probe: np.ndarray) -> float:
-    """TOP 아래쪽의 사다리꼴 영역이 실제 검은 토트 내부인지 확인한다."""
+    """TOP 아래 사다리꼴 영역이 실제 검은 토트 내부인지 확인한다."""
     polygon = np.rint(np.stack((tl, tr, right_probe, left_probe), axis=0)).astype(np.int32)
 
     mask = np.zeros_like(gray, dtype=np.uint8)
@@ -346,14 +370,14 @@ def dark_fraction(gray: np.ndarray, tl: np.ndarray, tr: np.ndarray, left_probe: 
     return float(np.mean(pixels < DARK_THRESHOLD))
 
 
-def evaluate_triplet(
+def evaluate_fine_triplet(
     top: LineCandidate,
     left: LineCandidate,
     right: LineCandidate,
     gray: np.ndarray,
     edges: np.ndarray,
 ) -> ToteFeature | None:
-    """TOP / LEFT / RIGHT 세 후보가 실제 토트 opening의 위쪽 구조인지 평가한다."""
+    """TOP / LEFT / RIGHT 세 후보를 이용해 FINE feature를 계산한다."""
     height, width = gray.shape
 
     tl = line_intersection(top.line_abc, left.line_abc)
@@ -378,7 +402,6 @@ def evaluate_triplet(
     if center[1] < height * 0.05 or center[1] > height * TOP_MAX_Y_RATIO:
         return None
 
-    # TOP에서 아래로 내려가면 LEFT는 더 왼쪽으로, RIGHT는 더 오른쪽으로 벌어져야 한다.
     probe_y = min(height * 0.90, center[1] + height * SIDE_PROBE_HEIGHT_RATIO)
 
     left_probe_x = line_x_at_y(left.line_abc, probe_y)
@@ -413,30 +436,38 @@ def evaluate_triplet(
 
     side_support = 0.5 * (left_support + right_support)
     length_score = min(1.0, top_width / (width * 0.80))
+
     score = 0.35 * top_support + 0.25 * side_support + 0.25 * inside_dark + 0.15 * length_score
 
     return ToteFeature(
+        mode="FINE",
         angle_deg=normalize_horizontal_angle_deg(top.angle_deg),
         center_x_px=float(center[0]),
         center_y_px=float(center[1]),
+        score=score,
+        top_p1=tl,
+        top_p2=tr,
         tl=tl,
         tr=tr,
         left_probe=left_probe,
         right_probe=right_probe,
-        score=score,
     )
 
 
-def detect_tote_feature(image: np.ndarray) -> tuple[ToteFeature | None, np.ndarray]:
-    """TOP / LEFT / RIGHT 후보 조합 중 가장 좋은 토트 feature를 선택한다."""
-    top_candidates, left_candidates, right_candidates, gray, edges = detect_line_candidates(image)
-
+def detect_fine_feature(
+    top_candidates: list[LineCandidate],
+    left_candidates: list[LineCandidate],
+    right_candidates: list[LineCandidate],
+    gray: np.ndarray,
+    edges: np.ndarray,
+) -> ToteFeature | None:
+    """후보 조합 중 가장 좋은 FINE 검출 결과를 선택한다."""
     best_feature = None
 
     for top in top_candidates:
         for left in left_candidates:
             for right in right_candidates:
-                feature = evaluate_triplet(top, left, right, gray, edges)
+                feature = evaluate_fine_triplet(top, left, right, gray, edges)
 
                 if feature is None:
                     continue
@@ -444,48 +475,149 @@ def detect_tote_feature(image: np.ndarray) -> tuple[ToteFeature | None, np.ndarr
                 if best_feature is None or feature.score > best_feature.score:
                     best_feature = feature
 
-    return best_feature, edges
+    return best_feature
+
+
+def detect_coarse_feature(top_candidates: list[LineCandidate]) -> ToteFeature | None:
+    """FINE 검출이 실패하면 TOP rim만 이용해 대략적인 위치와 각도를 계산한다."""
+    if not top_candidates:
+        return None
+
+    anchor = top_candidates[0]
+    grouped = []
+
+    for candidate in top_candidates:
+        if abs(candidate.center_y - anchor.center_y) > COARSE_TOP_Y_TOL_PX:
+            continue
+
+        if angle_difference_deg(candidate.angle_deg, anchor.angle_deg) > COARSE_TOP_ANGLE_TOL_DEG:
+            continue
+
+        grouped.append(candidate)
+
+    if not grouped:
+        grouped = [anchor]
+
+    points = []
+
+    for candidate in grouped:
+        x1, y1, x2, y2 = candidate.segment
+        points.append((x1, y1))
+        points.append((x2, y2))
+
+    points = np.asarray(points, dtype=np.float32)
+
+    vx, vy, fit_x, fit_y = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
+
+    if vx < 0.0:
+        vx = -vx
+        vy = -vy
+
+    angle_deg = normalize_horizontal_angle_deg(math.degrees(math.atan2(float(vy), float(vx))))
+
+    left_x = float(np.min(points[:, 0]))
+    right_x = float(np.max(points[:, 0]))
+
+    left_y = fitted_y_at_x(float(vx), float(vy), float(fit_x), float(fit_y), left_x)
+    right_y = fitted_y_at_x(float(vx), float(vy), float(fit_x), float(fit_y), right_x)
+
+    center_x = 0.5 * (left_x + right_x)
+    center_y = fitted_y_at_x(float(vx), float(vy), float(fit_x), float(fit_y), center_x)
+
+    top_p1 = np.asarray([left_x, left_y], dtype=np.float64)
+    top_p2 = np.asarray([right_x, right_y], dtype=np.float64)
+
+    # COARSE score는 실제 정밀도 의미가 아니라 사용한 TOP 후보의 평균 길이를 정규화한 참고값이다.
+    mean_length = float(np.mean([candidate.length for candidate in grouped]))
+    score = min(1.0, mean_length / 400.0)
+
+    return ToteFeature(
+        mode="COARSE",
+        angle_deg=angle_deg,
+        center_x_px=center_x,
+        center_y_px=center_y,
+        score=score,
+        top_p1=top_p1,
+        top_p2=top_p2,
+    )
+
+
+def detect_tote_feature(image: np.ndarray) -> tuple[ToteFeature | None, np.ndarray]:
+    """FINE 검출을 먼저 시도하고 실패하면 TOP-only COARSE 검출로 전환한다."""
+    top_candidates, left_candidates, right_candidates, gray, edges = detect_line_candidates(image)
+
+    fine_feature = detect_fine_feature(top_candidates, left_candidates, right_candidates, gray, edges)
+
+    if fine_feature is not None:
+        return fine_feature, edges
+
+    coarse_feature = detect_coarse_feature(top_candidates)
+
+    return coarse_feature, edges
 
 
 def draw_feature(image: np.ndarray, feature: ToteFeature | None) -> np.ndarray:
-    """TOP / LEFT / RIGHT와 TL/TR, 중심점을 영상에 표시한다."""
+    """FINE 또는 COARSE 검출 결과를 영상에 표시한다."""
     output = image.copy()
     height, width = output.shape[:2]
 
-    if feature is None:
-        cv2.putText(output, "TOTE FEATURE NOT FOUND", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-        return output
+    # COARSE에서 화면 안쪽으로 돌아왔다고 판단할 영역을 표시한다.
+    cv2.line(output, (int(COARSE_CENTER_LEFT_PX), 0), (int(COARSE_CENTER_LEFT_PX), height), (100, 100, 100), 1)
+    cv2.line(output, (int(COARSE_CENTER_RIGHT_PX), 0), (int(COARSE_CENTER_RIGHT_PX), height), (100, 100, 100), 1)
 
-    tl = tuple(np.rint(feature.tl).astype(int))
-    tr = tuple(np.rint(feature.tr).astype(int))
-    left_probe = tuple(np.rint(feature.left_probe).astype(int))
-    right_probe = tuple(np.rint(feature.right_probe).astype(int))
-
-    center = (int(round(feature.center_x_px)), int(round(feature.center_y_px)))
-
-    # TOP / LEFT / RIGHT 세 직선만 표시한다.
-    cv2.line(output, tl, tr, (0, 255, 255), 4, cv2.LINE_AA)
-    cv2.line(output, tl, left_probe, (0, 255, 0), 4, cv2.LINE_AA)
-    cv2.line(output, tr, right_probe, (255, 255, 0), 4, cv2.LINE_AA)
-
-    cv2.circle(output, tl, 7, (0, 0, 255), -1)
-    cv2.circle(output, tr, 7, (0, 0, 255), -1)
-    cv2.circle(output, center, 8, (255, 0, 255), -1)
-
-    cv2.putText(output, "TL", (tl[0] + 8, tl[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-    cv2.putText(output, "TR", (tr[0] + 8, tr[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-
-    # 영상 정중앙은 reference 확인용으로만 표시한다.
     cv2.drawMarker(output, (width // 2, height // 2), (255, 255, 255), cv2.MARKER_CROSS, 22, 2)
 
-    cv2.putText(output, "TOTE FEATURE FOUND", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+    if feature is None:
+        cv2.putText(output, "TOTE NOT FOUND", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2, cv2.LINE_AA)
+        return output
 
-    feature_text = (
+    top_p1 = tuple(np.rint(feature.top_p1).astype(int))
+    top_p2 = tuple(np.rint(feature.top_p2).astype(int))
+    center = (int(round(feature.center_x_px)), int(round(feature.center_y_px)))
+
+    if feature.mode == "FINE":
+        color = (0, 255, 0)
+
+        tl = tuple(np.rint(feature.tl).astype(int))
+        tr = tuple(np.rint(feature.tr).astype(int))
+        left_probe = tuple(np.rint(feature.left_probe).astype(int))
+        right_probe = tuple(np.rint(feature.right_probe).astype(int))
+
+        cv2.line(output, tl, tr, (0, 255, 255), 4, cv2.LINE_AA)
+        cv2.line(output, tl, left_probe, (0, 255, 0), 4, cv2.LINE_AA)
+        cv2.line(output, tr, right_probe, (255, 255, 0), 4, cv2.LINE_AA)
+
+        cv2.circle(output, tl, 7, (0, 0, 255), -1)
+        cv2.circle(output, tr, 7, (0, 0, 255), -1)
+
+        cv2.putText(output, "TL", (tl[0] + 8, tl[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(output, "TR", (tr[0] + 8, tr[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+
+    else:
+        color = (0, 165, 255)
+        cv2.line(output, top_p1, top_p2, color, 4, cv2.LINE_AA)
+
+    cv2.circle(output, center, 8, (255, 0, 255), -1)
+
+    title = f"{feature.mode} MODE"
+    cv2.putText(output, title, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA)
+
+    text = (
         f"angle={feature.angle_deg:+.2f} deg  cx={feature.center_x_px:.1f}  "
         f"cy={feature.center_y_px:.1f}  score={feature.score:.3f}"
     )
 
-    cv2.putText(output, feature_text, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(output, text, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
+
+    if feature.mode == "COARSE":
+        if feature.center_x_px < COARSE_CENTER_LEFT_PX:
+            direction_text = "TOTE LEFT  -> base should move RIGHT"
+        elif feature.center_x_px > COARSE_CENTER_RIGHT_PX:
+            direction_text = "TOTE RIGHT -> base should move LEFT"
+        else:
+            direction_text = "TOTE INSIDE RECOVERY AREA"
+
+        cv2.putText(output, direction_text, (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
     return output
 
@@ -493,28 +625,24 @@ def draw_feature(image: np.ndarray, feature: ToteFeature | None) -> np.ndarray:
 def print_feature(feature: ToteFeature) -> None:
     """현재 feature를 터미널에 출력한다."""
     print(
-        f"angle={feature.angle_deg:+7.3f} deg | center_x={feature.center_x_px:7.2f} px | "
+        f"{feature.mode:6s} | angle={feature.angle_deg:+7.3f} deg | center_x={feature.center_x_px:7.2f} px | "
         f"center_y={feature.center_y_px:7.2f} px | score={feature.score:.3f}"
     )
 
 
-def print_summary(history: deque[ToteFeature]) -> None:
-    """최근 유효 측정값의 평균, 표준편차, 최소값, 최대값을 출력한다."""
-    if not history:
-        print("측정값이 없습니다.")
+def print_stats(title: str, features: list[ToteFeature]) -> None:
+    """지정 mode의 측정 통계를 출력한다."""
+    if not features:
+        print(f"{title}: 측정값 없음")
         return
 
-    values = np.asarray(
-        [[item.angle_deg, item.center_x_px, item.center_y_px] for item in history],
-        dtype=np.float64,
-    )
+    values = np.asarray([[item.angle_deg, item.center_x_px, item.center_y_px] for item in features], dtype=np.float64)
 
     names = ("angle_deg", "center_x_px", "center_y_px")
     units = ("deg", "px", "px")
 
     print()
-    print("=" * 76)
-    print(f"최근 유효 측정 {len(history)} frames")
+    print(f"[{title}] {len(features)} frames")
 
     for index, (name, unit) in enumerate(zip(names, units)):
         mean = float(np.mean(values[:, index]))
@@ -524,7 +652,25 @@ def print_summary(history: deque[ToteFeature]) -> None:
 
         print(f"{name:12s}: mean={mean:+9.3f} {unit} | std={std:7.3f} | min={minimum:+9.3f} | max={maximum:+9.3f}")
 
-    print("=" * 76)
+
+def print_summary(history: deque[ToteFeature]) -> None:
+    """FINE과 COARSE 측정값을 분리해서 출력한다."""
+    if not history:
+        print("측정값이 없습니다.")
+        return
+
+    fine_features = [item for item in history if item.mode == "FINE"]
+    coarse_features = [item for item in history if item.mode == "COARSE"]
+
+    print()
+    print("=" * 82)
+    print(f"최근 유효 측정 {len(history)} frames | FINE={len(fine_features)} | COARSE={len(coarse_features)}")
+
+    print_stats("FINE", fine_features)
+    print_stats("COARSE", coarse_features)
+
+    print()
+    print("=" * 82)
     print()
 
 
@@ -565,7 +711,11 @@ def main():
 
     frame_count = 0
     last_result = None
+    last_edges = None
 
+    print()
+    print("FINE   : TOP + LEFT + RIGHT")
+    print("COARSE : TOP only")
     print()
     print("p: 최근 측정 통계")
     print("r: 측정값 초기화")
@@ -591,9 +741,11 @@ def main():
                     print_feature(feature)
 
             result = draw_feature(image, feature)
-            last_result = result
 
-            cv2.imshow("Tote 3-Line Feature", result)
+            last_result = result
+            last_edges = edges
+
+            cv2.imshow("Tote Feature", result)
             cv2.imshow("Edges", edges)
 
             key = cv2.waitKey(1) & 0xFF
@@ -611,7 +763,10 @@ def main():
 
             if key in (ord("s"), ord("S")) and last_result is not None:
                 cv2.imwrite("tote_feature.png", last_result)
-                cv2.imwrite("tote_edges.png", edges)
+
+                if last_edges is not None:
+                    cv2.imwrite("tote_edges.png", last_edges)
+
                 print("tote_feature.png / tote_edges.png 저장")
 
     finally:
