@@ -54,19 +54,22 @@ MIN_LEG_TIME = 1.5
 
 TARGET_ANGLE_DEG = 0.0
 TARGET_CENTER_X_PX = 339.36
+TARGET_CENTER_Y_PX = 105.5
 
 ANGLE_TOL_DEG = 1.0
 CENTER_X_TOL_PX = 5.0
+CENTER_Y_TOL_PX = 5.0
 
-# 실제 yaw 실험에서 얻은 image angle → base yaw 보정 계수.
-YAW_GAIN = 1.475
-YAW_SIGN = -1.0
-
-# lateral ±2 cm 실험에서 얻은 약 11.1 px/cm를 사용한다.
+# lateral ±2 cm 실험에서 얻은 값.
 LATERAL_M_PER_PX = 0.00090
+
+# forward ±2 cm 실험에서 얻은 값.
+# BACK 2 cm: cy=79, FORWARD 2 cm: cy=132 → 약 13.25 px/cm.
+FORWARD_M_PER_PX = 0.000755
 
 MAX_YAW_COMMAND_DEG = 10.0
 MAX_LATERAL_COMMAND_M = 0.04
+MAX_FORWARD_COMMAND_M = 0.04
 
 
 # ============================================================
@@ -122,8 +125,8 @@ EDGE_SEARCH_RADIUS = 4
 MIN_TOP_EDGE_SUPPORT = 0.55
 MIN_SIDE_EDGE_SUPPORT = 0.35
 
-TARGET_TOP_WIDTH_PX = 507.5
-TOP_WIDTH_TOL_PX = 15.0
+# TARGET_TOP_WIDTH_PX = 507.5
+# TOP_WIDTH_TOL_PX = 15.0
 
 # ============================================================
 # 여러 frame 측정
@@ -659,13 +662,6 @@ def measure_fine(pipeline: rs.pipeline, title: str) -> FineMeasurement | None:
         valid_frames=len(filtered),
     )
 
-    if abs(measurement.top_width_px - TARGET_TOP_WIDTH_PX) > TOP_WIDTH_TOL_PX:
-        print(
-            f"FINE width 이상: current={measurement.top_width_px:.2f} px, "
-            f"target={TARGET_TOP_WIDTH_PX:.2f} px"
-        )
-        return None
-
 
     print(
         f"FINE 측정 | angle={measurement.angle_deg:+.3f} deg | cx={measurement.center_x_px:.2f} px | "
@@ -765,6 +761,19 @@ def move_lateral(robot, monitor: OdometryMonitor, distance_m: float) -> bool:
     return move_leg(robot, monitor, leg, settle=SETTLE_S)
 
 
+def move_forward(robot, monitor: OdometryMonitor, distance_m: float) -> bool:
+    """현재 자세 기준으로 body X 방향만 상대 이동한다."""
+    leg = build_leg(
+        start=odom_pose(monitor.odom),
+        target=(distance_m, 0.0, 0.0),
+        absolute=False,
+        duration=linear_duration(distance_m),
+        turn_direction="shortest",
+    )
+
+    return move_leg(robot, monitor, leg, settle=SETTLE_S)
+
+
 # ============================================================
 # Align
 # ============================================================
@@ -854,6 +863,56 @@ def align_lateral(robot, monitor: OdometryMonitor, pipeline: rs.pipeline) -> boo
     return abs(final_error) <= CENTER_X_TOL_PX
 
 
+
+def align_forward(robot, monitor: OdometryMonitor, pipeline: rs.pipeline) -> bool:
+    """FINE center_y를 한 번 측정하고 전후 위치를 한 번에 보정한다."""
+    print()
+    print("========== FORWARD ALIGN ==========")
+
+    before = measure_fine(pipeline, "FORWARD BEFORE")
+
+    if before is None:
+        return False
+
+    error_px = before.center_y_px - TARGET_CENTER_Y_PX
+
+    if abs(error_px) <= CENTER_Y_TOL_PX:
+        print("이미 Forward 정렬 범위 안입니다.")
+        return True
+
+    # cy가 작으면 토트가 멀리 있으므로 앞으로(+X), cy가 크면 가까우므로 뒤로(-X) 이동한다.
+    command_m = (TARGET_CENTER_Y_PX - before.center_y_px) * FORWARD_M_PER_PX
+    command_m = clamp(command_m, -MAX_FORWARD_COMMAND_M, MAX_FORWARD_COMMAND_M)
+
+    print(f"Center_y current : {before.center_y_px:.2f} px")
+    print(f"Center_y target  : {TARGET_CENTER_Y_PX:.2f} px")
+    print(f"Center_y error   : {error_px:+.2f} px")
+    print(f"Forward command  : {command_m:+.4f} m")
+
+    if not move_forward(robot, monitor, command_m):
+        return False
+
+    time.sleep(SETTLE_S)
+    flush_camera(pipeline)
+
+    after = measure_fine(pipeline, "FORWARD AFTER")
+
+    if after is None:
+        return False
+
+    final_error = after.center_y_px - TARGET_CENTER_Y_PX
+
+    print(f"Forward before : {before.center_y_px:.2f} px")
+    print(f"Forward after  : {after.center_y_px:.2f} px")
+    print(f"Final error    : {final_error:+.2f} px")
+
+    return abs(final_error) <= CENTER_Y_TOL_PX
+
+
+
+
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -900,6 +959,7 @@ def main():
         print("====================================")
         print(f"Target angle : {TARGET_ANGLE_DEG:+.2f} deg")
         print(f"Target cx    : {TARGET_CENTER_X_PX:.2f} px")
+        print(f"Target cy    : {TARGET_CENTER_Y_PX:.2f} px")
 
         if not align_yaw(robot, monitor, pipeline):
             print("\nRESULT: YAW FAILED")
@@ -910,6 +970,13 @@ def main():
 
         if not align_lateral(robot, monitor, pipeline):
             print("\nRESULT: LATERAL FAILED")
+            return
+
+        time.sleep(SETTLE_S)
+        flush_camera(pipeline)
+
+        if not align_forward(robot, monitor, pipeline):
+            print("\nRESULT: FORWARD FAILED")
             return
 
         print()
