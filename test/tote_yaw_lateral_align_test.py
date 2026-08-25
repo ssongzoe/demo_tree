@@ -57,19 +57,19 @@ TARGET_CENTER_X_PX = 339.36
 TARGET_CENTER_Y_PX = 105.5
 
 ANGLE_TOL_DEG = 1.0
-CENTER_X_TOL_PX = 5.0
-CENTER_Y_TOL_PX = 5.0
+CENTER_X_TOL_PX = 10.0
+CENTER_Y_TOL_PX = 10.0
 
 # lateral ±2 cm 실험에서 얻은 값.
 LATERAL_M_PER_PX = 0.00090
 
 # forward ±2 cm 실험에서 얻은 값.
 # BACK 2 cm: cy=79, FORWARD 2 cm: cy=132 → 약 13.25 px/cm.
-FORWARD_M_PER_PX = 0.000755
+FORWARD_M_PER_PX = 0.002
 
 MAX_YAW_COMMAND_DEG = 10.0
 MAX_LATERAL_COMMAND_M = 0.04
-MAX_FORWARD_COMMAND_M = 0.04
+MAX_FORWARD_COMMAND_M = 0.06
 
 
 # ============================================================
