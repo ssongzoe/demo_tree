@@ -17,6 +17,7 @@ python test/tote_yaw_align_test.py --serial 250122079439
 import argparse
 from dataclasses import dataclass
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -25,6 +26,9 @@ import numpy as np
 import pyrealsense2 as rs
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 
@@ -56,7 +60,7 @@ ANGLE_TOL_DEG = 0.8
 YAW_GAIN = 1.5
 
 # 사용자 테스트에서 base +yaw → 영상 angle 감소였으므로 현재 error와 같은 부호로 회전한다.
-YAW_SIGN = 1.0
+YAW_SIGN = -1.0
 
 # 한 번에 큰 각도를 돌리지 않고 측정 → 이동 → 재측정을 반복한다.
 MAX_YAW_STEP_DEG = 2.0
