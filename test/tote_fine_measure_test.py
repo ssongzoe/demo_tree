@@ -389,21 +389,24 @@ def evaluate_triplet(
 
 
 def detect_fine_feature(image: np.ndarray) -> tuple[FineFeature | None, np.ndarray]:
-    """모든 후보 조합 중 가장 좋은 FINE feature를 선택한다."""
+    """유효한 조합 중 TOP 폭이 가장 큰 FINE feature를 선택한다."""
     top_candidates, left_candidates, right_candidates, edges = detect_line_candidates(image)
 
-    best_feature = None
+    valid_features = []
 
     for top in top_candidates:
         for left in left_candidates:
             for right in right_candidates:
                 feature = evaluate_triplet(top, left, right, edges)
 
-                if feature is None:
-                    continue
+                if feature is not None:
+                    valid_features.append(feature)
 
-                if best_feature is None or feature.score > best_feature.score:
-                    best_feature = feature
+    if not valid_features:
+        return None, edges
+
+    # 토트의 안쪽 선보다 실제 바깥쪽 LEFT / RIGHT rim을 선택하도록 TOP 폭이 가장 큰 조합을 사용한다.
+    best_feature = max(valid_features, key=lambda feature: feature.top_width_px)
 
     return best_feature, edges
 
