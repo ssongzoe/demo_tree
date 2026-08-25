@@ -17,7 +17,8 @@ python test/tote_yaw_align_test.py --serial 250122079439
 import argparse
 from dataclasses import dataclass
 import math
-import time, Path
+import time
+from pathlib import Path
 
 import cv2
 import numpy as np
