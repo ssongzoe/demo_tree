@@ -67,11 +67,11 @@ UP_LEFT = np.deg2rad([-56.215, 32.642, 20.524, -39.767, 47.012, 73.780, 0.0]).to
 
 BACK_TARGET = (-0.10, 0.0, 0.0)
 TURN_TARGET = (-0.05, -0.05, math.radians(-180.43))
-STRAIGHT_TARGET = (0.45, 0.0, 0.0)
+STRAIGHT_TARGET = (0.65, 0.0, 0.0)
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 RETURN_TURN_TARGET = (0.0, 0.0, math.radians(179.43))
-RETURN_STRAIGHT_TARGET = (0.70, 0.0, 0.0)
+RETURN_STRAIGHT_TARGET = (0.82, 0.0, 0.0)
 
 
 def describe_target(target) -> str:
@@ -107,7 +107,7 @@ def run_turn_and_go(robot, monitor, ar_aligner: ARAligner) -> bool:
 
         ar_aligner.start()
 
-        if not run_mobile_leg(robot, monitor, stream, "이송 3/3", STRAIGHT_TARGET, 5.0, True, 0.2):
+        if not run_mobile_leg(robot, monitor, stream, "이송 3/3", STRAIGHT_TARGET, 5.0, True, 0.5):
             return False
 
         return True

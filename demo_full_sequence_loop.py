@@ -2,13 +2,14 @@
 """RB-Y1 tote 인식/파지, 모바일 이송, AR 정렬, 배치 및 복귀 통합 데모.
 
 동작 순서
+0. Tote D435와 AR RealSense를 한 번만 시작하고 전체 반복 데모 동안 계속 streaming
 1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
 2. GRASP 자세로 진입한 뒤 그리퍼를 닫고 UP 자세로 들어 올림
 3. BACK_TARGET → TURN_TARGET → STRAIGHT_TARGET 순서로 기존 이송 경로 수행
 4. AR 마커 기준으로 배치 위치 정렬
 5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE 자세로 후퇴
 6. RETURN_BACK_TARGET → RETURN_TURN_TARGET → RETURN_STRAIGHT_TARGET 순서로 기존 복귀 경로 수행
-7. 복귀가 끝나면 같은 과정을 다시 시작하며, --cycles 0(기본값)은 Ctrl+C 전까지 무한 반복
+7. Tote / AR 카메라는 시작할 때 한 번만 켜고 계속 유지하며, 복귀가 끝나면 같은 과정을 즉시 다시 시작
 
 이동 거리와 회전각은 아래 target 상수만 수정하면 되며, 실행 로그는 target 값을 직접 읽어 출력하므로 값과 설명이 따로 어긋나지 않는다.
 """
@@ -25,7 +26,7 @@ from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms
 from skills.ar_align import ARAligner
-from skills.tote_align import align_tote
+from skills.tote_align import ToteAligner
 
 
 # -----------------------------------------------------------------------------
@@ -93,7 +94,7 @@ def run_mobile_leg(robot, monitor, stream, step: str, target, duration: float, s
     return move_leg(robot, monitor, leg, settle=settle, stream=stream, stop_at_end=stop_at_end)
 
 
-def run_turn_and_go(robot, monitor, ar_aligner: ARAligner) -> bool:
+def run_turn_and_go(robot, monitor) -> bool:
     stream = robot.create_command_stream(priority=10)
 
     try:
@@ -102,8 +103,6 @@ def run_turn_and_go(robot, monitor, ar_aligner: ARAligner) -> bool:
 
         if not run_mobile_leg(robot, monitor, stream, "이송 2/3", TURN_TARGET, 7.0, False, 0.0):
             return False
-
-        ar_aligner.start()
 
         if not run_mobile_leg(robot, monitor, stream, "이송 3/3", STRAIGHT_TARGET, 5.0, True, 0.2):
             return False
@@ -142,14 +141,13 @@ def detect_grasp_and_lift(
     robot,
     monitor,
     gripper,
-    tote_camera_serial: str,
+    tote_aligner: ToteAligner,
     gripper_target: float,
     gripper_torque: float,
-    show: bool,
 ) -> bool:
     """현재 자세에서 tote를 인식해 base를 정렬한 뒤 GRASP로 진입하고, 그리퍼를 닫아 UP 자세로 들어 올린다."""
     print("[1/3] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
-    if not align_tote(robot, monitor, camera_serial=tote_camera_serial, verify=True, show=show):
+    if not tote_aligner.align(robot, monitor, verify=True):
         print("Tote one-shot 정렬 실패")
         return False
 
@@ -189,7 +187,7 @@ def lower_release_and_retract(robot, gripper) -> bool:
 
 
 
-def run_cycle(robot, monitor, gripper, ar_aligner, args, cycle_index: int) -> None:
+def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_index: int) -> None:
     """박스 인식/파지부터 이송, AR 정렬, 배치, 복귀까지 한 사이클을 수행하며 완료 후 다음 사이클을 같은 위치에서 시작한다."""
     print(f"\n{'=' * 24} CYCLE {cycle_index} START {'=' * 24}")
 
@@ -197,24 +195,19 @@ def run_cycle(robot, monitor, gripper, ar_aligner, args, cycle_index: int) -> No
         robot,
         monitor,
         gripper,
-        tote_camera_serial=args.tote_camera_serial,
+        tote_aligner=tote_aligner,
         gripper_target=args.gripper_target,
         gripper_torque=args.gripper_torque,
-        show=args.show_tote,
     ):
         raise RuntimeError("Tote 인식 / 정렬 / 파지 실패")
 
     print(f"이송 시작: {describe_target(BACK_TARGET)} → {describe_target(TURN_TARGET)} → {describe_target(STRAIGHT_TARGET)}")
-    if not run_turn_and_go(robot, monitor, ar_aligner):
+    if not run_turn_and_go(robot, monitor):
         raise RuntimeError("Turn-and-go 실패")
 
-    try:
-        print("AR 마커 one-shot 정렬")
-        if not ar_aligner.align(robot, monitor):
-            raise RuntimeError("AR 마커 정렬 실패")
-    finally:
-        # 다음 사이클의 tote 카메라와 동시에 RealSense stream이 열리지 않도록 AR 정렬이 끝나면 바로 종료한다.
-        ar_aligner.stop()
+    print("AR 마커 one-shot 정렬")
+    if not ar_aligner.align(robot, monitor):
+        raise RuntimeError("AR 마커 정렬 실패")
 
     if not lower_release_and_retract(robot, gripper):
         raise RuntimeError("Tote 배치 실패")
@@ -244,6 +237,7 @@ def main() -> None:
     robot = initialize_mobile(args.address, args.model, power=".*", servo=".*", unlimited=False)
 
     gripper = None
+    tote_aligner = ToteAligner(camera_serial=args.tote_camera_serial, show=args.show_tote)
     ar_aligner = ARAligner(marker_id=args.marker_id, camera_serial=args.ar_camera_serial)
     monitor = OdometryMonitor()
     state_update_started = False
@@ -264,10 +258,15 @@ def main() -> None:
         if not wait_for_odometry(monitor):
             raise RuntimeError("Odometry를 받지 못했습니다.")
 
+        # 두 RealSense는 프로그램 시작 시 한 번만 켜고 모든 cycle에서 stream을 계속 유지한다.
+        print("Tote / AR 카메라 시작")
+        tote_aligner.start()
+        ar_aligner.start()
+
         cycle_index = 1
 
         while args.cycles == 0 or cycle_index <= args.cycles:
-            run_cycle(robot, monitor, gripper, ar_aligner, args, cycle_index)
+            run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_index)
             completed_cycles += 1
             cycle_index += 1
 
@@ -280,6 +279,7 @@ def main() -> None:
         print(f"반복 데모 실패: {error} | 완료 사이클: {completed_cycles}")
 
     finally:
+        tote_aligner.stop()
         ar_aligner.stop()
 
         if state_update_started:
