@@ -16,7 +16,7 @@ import rby1_sdk as rby
 
 
 READY_POSE = {
-    "torso": np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist(),
+    "torso": np.deg2rad([0.0, 20.0, -45.0, 45.0, 0.0, 0.0]).tolist(),
     "right_arm": np.deg2rad([-10.0, -40.0, -5.0, -110.0, -35.0, 50.0, 0.0]).tolist(),
     "left_arm": np.deg2rad([-10.0, 40.0, -5.0, -110.0, 35.0, 50.0, 0.0]).tolist(),
     "head": np.deg2rad([0.0, 43.0]).tolist(),
@@ -73,3 +73,32 @@ def move_to_ready_pose(robot) -> bool:
         minimum_time=READY_MINIMUM_TIME,
         timeout_ms=READY_TIMEOUT_MS,
     )
+
+
+def move_both_arms(
+    robot,
+    right_position: np.ndarray,
+    left_position: np.ndarray,
+    minimum_time: float,
+    timeout_ms: int = 20000,
+) -> bool:
+    """torso와 head는 유지하고 양팔 관절 목표만 동시에 보낸다."""
+    command = rby.RobotCommandBuilder().set_command(
+        rby.ComponentBasedCommandBuilder().set_body_command(
+            rby.BodyComponentBasedCommandBuilder()
+            .set_right_arm_command(_joint_position_command(right_position, minimum_time))
+            .set_left_arm_command(_joint_position_command(left_position, minimum_time))
+        )
+    )
+
+    handler = robot.send_command(command)
+
+    if handler.wait_for(timeout_ms) is False:
+        handler.cancel()
+        handler.wait_for(2000)
+        return False
+
+    feedback = handler.get()
+    print(f"양팔 동작 완료: {feedback.finish_code}")
+
+    return feedback.finish_code == rby.RobotCommandFeedback.FinishCode.Ok
