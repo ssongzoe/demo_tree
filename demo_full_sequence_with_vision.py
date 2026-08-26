@@ -77,7 +77,7 @@ STRAIGHT_TARGET = (0.75, 0.0, 0.0)
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 RETURN_TURN_TARGET = (0.0, 0.0, math.radians(179.43))
-RETURN_STRAIGHT_TARGET = (1.15, -0.20, 0.0)
+RETURN_STRAIGHT_TARGET = (0.3, -0.10, 0.0)
 
 
 def describe_target(target) -> str:
