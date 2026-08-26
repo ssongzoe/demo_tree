@@ -22,8 +22,8 @@ import numpy as np
 
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
-from control.robot_controller import READY_POSE, move_both_arms, move_to_upper_body_pose
-from skills.ar_align import align_to_marker
+from control.robot_controller import READY_POSE, move_both_arms
+from skills.ar_align import ARAligner
 from skills.tote_align import align_tote
 
 
@@ -46,7 +46,7 @@ DEFAULT_GRIPPER_TORQUE = 0.20
 # torso는 BEFORE / GRASP / UP 동안 동일하게 유지하며, 아래 값 하나만 사용한다.
 # -----------------------------------------------------------------------------
 
-TORSO_POSE = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
+# TORSO_POSE = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 
 BEFORE_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
 BEFORE_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
@@ -57,12 +57,6 @@ GRASP_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.03
 UP_RIGHT = np.deg2rad([-56.214, -32.637, -20.526, -39.769, -47.012, 73.779, 0.001]).tolist()
 UP_LEFT = np.deg2rad([-56.215, 32.642, 20.524, -39.767, 47.012, 73.780, 0.0]).tolist()
 
-BEFORE_POSE = {
-    "torso": TORSO_POSE,
-    "right_arm": BEFORE_RIGHT,
-    "left_arm": BEFORE_LEFT,
-    "head": READY_POSE["head"],
-}
 
 
 # -----------------------------------------------------------------------------
@@ -73,11 +67,11 @@ BEFORE_POSE = {
 
 BACK_TARGET = (-0.10, 0.0, 0.0)
 TURN_TARGET = (-0.05, -0.05, math.radians(-180.43))
-STRAIGHT_TARGET = (0.75, 0.0, 0.0)
+STRAIGHT_TARGET = (0.45, 0.0, 0.0)
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 RETURN_TURN_TARGET = (0.0, 0.0, math.radians(179.43))
-RETURN_STRAIGHT_TARGET = (0.3, -0.10, 0.0)
+RETURN_STRAIGHT_TARGET = (0.70, 0.0, 0.0)
 
 
 def describe_target(target) -> str:
@@ -101,21 +95,20 @@ def run_mobile_leg(robot, monitor, stream, step: str, target, duration: float, s
     return move_leg(robot, monitor, leg, settle=settle, stream=stream, stop_at_end=stop_at_end)
 
 
-def run_turn_and_go(robot, monitor) -> bool:
-    """박스를 들어 올린 뒤 BACK → TURN → STRAIGHT target을 기존 순서와 시간 설정 그대로 연속 수행한다."""
+def run_turn_and_go(robot, monitor, ar_aligner: ARAligner) -> bool:
     stream = robot.create_command_stream(priority=10)
 
     try:
-        legs = [
-            ("이송 1/3", BACK_TARGET, 2.0, False, 0.0),
-            ("이송 2/3", TURN_TARGET, 7.0, False, 0.0),
-            ("이송 3/3", STRAIGHT_TARGET, 5.0, True, 1.5),
-        ]
+        if not run_mobile_leg(robot, monitor, stream, "이송 1/3", BACK_TARGET, 2.0, False, 0.0):
+            return False
 
-        for step, target, duration, stop_at_end, settle in legs:
-            if not run_mobile_leg(robot, monitor, stream, step, target, duration, stop_at_end, settle):
-                print(f"{step} 실패: {describe_target(target)}")
-                return False
+        if not run_mobile_leg(robot, monitor, stream, "이송 2/3", TURN_TARGET, 7.0, False, 0.0):
+            return False
+
+        ar_aligner.start()
+
+        if not run_mobile_leg(robot, monitor, stream, "이송 3/3", STRAIGHT_TARGET, 5.0, True, 0.2):
+            return False
 
         return True
 
@@ -132,7 +125,7 @@ def run_return_route(robot, monitor) -> bool:
         legs = [
             ("복귀 1/3", RETURN_BACK_TARGET, 3.0, False, 0.0),
             ("복귀 2/3", RETURN_TURN_TARGET, 10.0, False, 0.0),
-            ("복귀 3/3", RETURN_STRAIGHT_TARGET, 5.0, True, 1.5),
+            ("복귀 3/3", RETURN_STRAIGHT_TARGET, 5.0, True, 0.2),
         ]
 
         for step, target, duration, stop_at_end, settle in legs:
@@ -163,7 +156,7 @@ def detect_grasp_and_lift(
         return False
 
     print("[2/3] BEFORE → GRASP")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
+    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=0.5):
         print("GRASP 자세 이동 실패")
         return False
 
@@ -172,7 +165,7 @@ def detect_grasp_and_lift(
     print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
 
     print("[3/3] GRASP → UP")
-    if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=2.0):
+    if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.0):
         print("UP 자세 이동 실패")
         return False
 
@@ -182,7 +175,7 @@ def detect_grasp_and_lift(
 def lower_release_and_retract(robot, gripper) -> bool:
     """AR 정렬 후 UP에서 GRASP로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 BEFORE 자세로 양팔을 후퇴한다."""
     print("[5/6] UP → GRASP")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=2.0):
+    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
         print("GRASP 자세 이동 실패")
         return False
 
@@ -213,6 +206,7 @@ def main() -> None:
     robot = initialize_mobile(args.address, args.model, power=".*", servo=".*", unlimited=False)
 
     gripper = None
+    ar_aligner = ARAligner(marker_id=args.marker_id, camera_serial=args.ar_camera_serial)
     monitor = OdometryMonitor()
     state_update_started = False
     demo_completed = False
@@ -232,7 +226,7 @@ def main() -> None:
 
         if not wait_for_odometry(monitor):
             raise RuntimeError("Odometry를 받지 못했습니다.")
-
+        # 박스 잡기 
         if not detect_grasp_and_lift(
             robot,
             monitor,
@@ -245,11 +239,11 @@ def main() -> None:
             raise RuntimeError("Tote 인식 / 정렬 / 파지 실패")
 
         print(f"이송 시작: {describe_target(BACK_TARGET)} → {describe_target(TURN_TARGET)} → {describe_target(STRAIGHT_TARGET)}")
-        if not run_turn_and_go(robot, monitor):
+        if not run_turn_and_go(robot, monitor, ar_aligner):
             raise RuntimeError("Turn-and-go 실패")
 
-        print(f"AR 마커 정렬: marker_id={args.marker_id}, camera={args.ar_camera_serial}")
-        if not align_to_marker(robot, monitor, marker_id=args.marker_id, camera_serial=args.ar_camera_serial):
+        print("AR 마커 one-shot 정렬")
+        if not ar_aligner.align(robot, monitor):
             raise RuntimeError("AR 마커 정렬 실패")
 
         if not lower_release_and_retract(robot, gripper):
@@ -272,6 +266,8 @@ def main() -> None:
         print(f"통합 데모 실패: {error}")
 
     finally:
+        ar_aligner.stop()
+
         if state_update_started:
             try:
                 robot.stop_state_update()

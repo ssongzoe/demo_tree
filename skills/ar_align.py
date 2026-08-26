@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """AR 마커 기준 모바일 베이스 one-shot 정렬 skill.
 
-동작
-1. 마커를 한 번 측정한다.
-2. 현재 marker pose와 목표 marker pose 차이에서 로봇 x / y / yaw 명령을 동시에 계산한다.
-3. build_leg()에 x / y / yaw를 한 번에 넣어 하나의 SE(2) trajectory로 이동한다.
-
+마커 카메라는 주행 중 미리 켜둘 수 있으며, 정렬 시점에는 fresh frame만 짧게 모아 x / y / yaw를 한 번에 보정한다.
 기존 yaw 이동 → 재측정 → 위치 이동 구조와 달리 실제 로봇 이동은 한 번만 수행한다.
 """
 
 import math
+import time
 
 import numpy as np
 
@@ -26,7 +23,7 @@ CAM_WIDTH = 848
 CAM_HEIGHT = 480
 CAM_FPS = 15
 
-# OpenCV 카메라 좌표계: +x 오른쪽, +y 아래쪽, +z 전방
+# 실제 배치 목표 위치에서 측정한 marker pose
 TARGET_MARKER_POS = np.array([0.025, 0.069, 0.255], dtype=np.float64)
 TARGET_MARKER_YAW_DEG = 1.74
 
@@ -38,14 +35,20 @@ ALIGN_LINEAR_SPEED = 0.15
 ALIGN_ANGULAR_SPEED = 0.5
 QUINTIC_PEAK = 1.875
 MIN_LEG_TIME = 1.5
-SETTLE_S = 0.7
+SETTLE_S = 0.2
 
+# 카메라를 이미 켜둔 상태에서 이동 후 쌓인 frame은 조금만 버리고, fresh detection 4개 median으로 빠르게 측정한다.
+MEASURE_FRAMES = 4
+FLUSH_FRAMES = 2
+MEASURE_TIMEOUT_S = 2.0
+
+# 잘못된 검출값 하나로 비정상적으로 큰 이동을 만드는 경우만 막는 느슨한 guard
 MAX_TRANSLATION_M = 0.80
 MAX_YAW_DEG = 30.0
 
 
 def _move_duration(distance: float, angle_rad: float) -> float:
-    """병진과 회전을 동시에 수행할 수 있도록 필요한 시간 중 큰 값을 trajectory duration으로 사용한다."""
+    """병진과 회전을 동시에 수행하므로 두 동작에 필요한 시간 중 큰 값을 trajectory duration으로 사용한다."""
     linear_time = QUINTIC_PEAK * distance / ALIGN_LINEAR_SPEED
     angular_time = QUINTIC_PEAK * abs(angle_rad) / ALIGN_ANGULAR_SPEED
     return max(linear_time, angular_time, MIN_LEG_TIME)
@@ -56,14 +59,14 @@ def _one_shot_command(position, yaw_deg: float, target_marker_pos, target_marker
     current = np.asarray(position, dtype=np.float64)
     target = np.asarray(target_marker_pos, dtype=np.float64)
 
-    # 기존 ar_align 좌표 대응을 그대로 사용한다: camera +z = robot +x, camera +x = robot -y.
+    # OpenCV camera +z = robot +x(forward), camera +x = robot -y(lateral)
     marker_current_xy = np.array([current[2], -current[0]], dtype=np.float64)
     marker_target_xy = np.array([target[2], -target[0]], dtype=np.float64)
 
     yaw_error_deg = float(yaw_deg - target_marker_yaw_deg)
     theta = math.radians(yaw_error_deg)
 
-    # 회전과 병진을 한 번에 수행해도 marker가 목표 위치에 오도록 목표 marker 위치를 현재 robot frame으로 회전시킨다.
+    # x / y / yaw를 동시에 움직여도 최종 marker 위치가 target에 오도록 회전이 위치에 미치는 영향까지 포함한다.
     c = math.cos(theta)
     s = math.sin(theta)
     rotation = np.array([[c, -s], [s, c]], dtype=np.float64)
@@ -85,39 +88,81 @@ def _move_relative(robot, monitor, x: float, y: float, theta: float, duration: f
     return move_leg(robot, monitor, leg, settle=SETTLE_S)
 
 
-def align_to_marker(
-    robot,
-    monitor,
-    marker_id,
-    camera_serial=None,
-    target_marker_pos=TARGET_MARKER_POS,
-    target_marker_yaw_deg=TARGET_MARKER_YAW_DEG,
-    verify=False,
-):
-    """마커를 한 번 측정한 뒤 x / y / yaw를 동시에 보정하여 one-shot으로 목표 marker pose에 정렬한다."""
-    detector = create_detector(ARUCO_DICT)
-    pnp_size = MARKER_SIZE * MARKER_SCALE
-    camera = RealSenseCamera(CAM_WIDTH, CAM_HEIGHT, CAM_FPS, serial=camera_serial)
+class ARAligner:
+    """카메라를 미리 시작해 두고 필요할 때 fresh marker pose만 빠르게 측정하여 one-shot 정렬하는 객체."""
 
-    try:
-        print("AR 카메라 시작")
-        camera.start()
+    def __init__(
+        self,
+        marker_id,
+        camera_serial=None,
+        target_marker_pos=TARGET_MARKER_POS,
+        target_marker_yaw_deg=TARGET_MARKER_YAW_DEG,
+    ):
+        self.marker_id = marker_id
+        self.target_marker_pos = np.asarray(target_marker_pos, dtype=np.float64)
+        self.target_marker_yaw_deg = float(target_marker_yaw_deg)
 
-        position, yaw_deg = measure_marker(camera, detector, marker_id, pnp_size)
+        self.detector = create_detector(ARUCO_DICT)
+        self.pnp_size = MARKER_SIZE * MARKER_SCALE
+        self.camera = RealSenseCamera(CAM_WIDTH, CAM_HEIGHT, CAM_FPS, serial=camera_serial)
+        self.started = False
+
+    def start(self) -> None:
+        """AR 카메라를 한 번만 시작하며, 이후 주행 중에도 stream을 유지해 정렬 직전 startup 시간을 없앤다."""
+        if self.started:
+            return
+
+        start_time = time.perf_counter()
+        print("AR 카메라 미리 시작")
+        self.camera.start()
+        self.started = True
+        print(f"AR 카메라 시작 완료: {time.perf_counter() - start_time:.3f} s")
+
+    def stop(self) -> None:
+        """시작된 AR 카메라 stream을 종료한다."""
+        if not self.started:
+            return
+
+        self.camera.stop()
+        self.started = False
+
+    def _measure(self):
+        """이동 중 쌓인 frame을 조금 버리고 4개의 fresh detection median을 반환하며 실제 측정 시간을 함께 출력한다."""
+        start_time = time.perf_counter()
+
+        position, yaw_deg = measure_marker(
+            self.camera,
+            self.detector,
+            self.marker_id,
+            self.pnp_size,
+            measure_frames=MEASURE_FRAMES,
+            flush_frames=FLUSH_FRAMES,
+            timeout_s=MEASURE_TIMEOUT_S,
+        )
+
+        print(f"AR marker 측정 시간: {time.perf_counter() - start_time:.3f} s")
+        return position, yaw_deg
+
+    def align(self, robot, monitor, verify=False) -> bool:
+        """현재 fresh marker pose에서 x / y / yaw를 동시에 계산해 한 번의 SE(2) trajectory로 목표 위치에 정렬한다."""
+        if not self.started:
+            self.start()
+
+        position, yaw_deg = self._measure()
 
         if position is None or yaw_deg is None:
-            print(f"마커 id={marker_id} 검출 실패")
+            print(f"마커 id={self.marker_id} 검출 실패")
             return False
 
-        target = np.asarray(target_marker_pos, dtype=np.float64)
+        target = self.target_marker_pos
         error = np.asarray(position, dtype=np.float64) - target
-        x, y, theta, yaw_error_deg = _one_shot_command(position, yaw_deg, target, target_marker_yaw_deg)
+        x, y, theta, yaw_error_deg = _one_shot_command(position, yaw_deg, target, self.target_marker_yaw_deg)
 
         distance = float(np.hypot(x, y))
         vertical_error = float(error[1])
 
         print(f"AR 측정: x={position[0]:+.3f}, y={position[1]:+.3f}, z={position[2]:+.3f} m, yaw={yaw_deg:+.2f} deg")
-        print(f"AR 목표: x={target[0]:+.3f}, y={target[1]:+.3f}, z={target[2]:+.3f} m, yaw={target_marker_yaw_deg:+.2f} deg")
+        print(f"AR 목표: x={target[0]:+.3f}, y={target[1]:+.3f}, z={target[2]:+.3f} m, yaw={self.target_marker_yaw_deg:+.2f} deg")
         print(f"One-shot command: x={x:+.3f} m, y={y:+.3f} m, yaw={yaw_error_deg:+.2f} deg")
 
         if abs(vertical_error) > VERTICAL_WARN_M:
@@ -142,21 +187,38 @@ def align_to_marker(
             print("AR one-shot 정렬 완료")
             return True
 
-        final_position, final_yaw_deg = measure_marker(camera, detector, marker_id, pnp_size)
+        final_position, final_yaw_deg = self._measure()
 
         if final_position is None or final_yaw_deg is None:
             print("이동은 완료했지만 최종 marker 확인에 실패했습니다.")
             return True
 
         final_error = np.asarray(final_position, dtype=np.float64) - target
-        final_yaw_error = float(final_yaw_deg - target_marker_yaw_deg)
+        final_yaw_error = float(final_yaw_deg - self.target_marker_yaw_deg)
 
-        print(
-            f"최종 확인: x_err={final_error[0]:+.3f} m, z_err={final_error[2]:+.3f} m, "
-            f"yaw_err={final_yaw_error:+.2f} deg"
-        )
-
+        print(f"최종 확인: x_err={final_error[0]:+.3f} m, z_err={final_error[2]:+.3f} m, yaw_err={final_yaw_error:+.2f} deg")
         return True
 
+
+def align_to_marker(
+    robot,
+    monitor,
+    marker_id,
+    camera_serial=None,
+    target_marker_pos=TARGET_MARKER_POS,
+    target_marker_yaw_deg=TARGET_MARKER_YAW_DEG,
+    verify=False,
+):
+    """기존 demo_align.py 호환용 함수이며, 단독 호출 시에는 내부에서 카메라 start / align / stop을 모두 수행한다."""
+    aligner = ARAligner(
+        marker_id=marker_id,
+        camera_serial=camera_serial,
+        target_marker_pos=target_marker_pos,
+        target_marker_yaw_deg=target_marker_yaw_deg,
+    )
+
+    try:
+        aligner.start()
+        return aligner.align(robot, monitor, verify=verify)
     finally:
-        camera.stop()
+        aligner.stop()
