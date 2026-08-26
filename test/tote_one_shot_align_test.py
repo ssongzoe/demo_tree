@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TOP rim + LEFT top corner(TL)로 x / y / yaw를 동시에 추정하고 SE(2) 한 번으로 정렬하는 테스트.
+"""자동 X/Y/Yaw calibration 결과를 반영해 TOP rim + TL로 SE(2) 한 번 정렬하는 V2 테스트.
 
 전제
 - 카메라/브라켓 위치는 calibration 당시와 동일하다.
@@ -8,10 +8,10 @@
 - local Jacobian은 grasp 성공 기준 자세 근처의 ±2 cm / ±2 deg calibration 결과를 사용한다.
 
 실행:
-python test/tote_one_shot_align_test.py --serial 250122079439
+python test/tote_one_shot_align_test_v2.py --serial 250122079439
 
 dry-run:
-python test/tote_one_shot_align_test.py --serial 250122079439 --dry-run
+python test/tote_one_shot_align_test_v2.py --serial 250122079439 --dry-run
 """
 
 from __future__ import annotations
@@ -70,13 +70,14 @@ TARGET_ANGLE_DEG = 0.000
 # feature_error = [TL.x(px), TL.y(px), top_angle(deg)]
 # pose_error    = [x(m), y(m), robot_yaw(deg)]
 #
-# x/y column: 기준 자세에서 약 ±2 cm 수동 calibration 중앙차분
+# x/y column: ±2 cm 자동 odom calibration 결과
 # yaw column: ±2 deg 자동 odom calibration 3회 평균
+# TOP angle은 translation이 아니라 yaw에만 반응한다고 두어 x/y -> angle coupling은 0으로 둔다.
 J_LEFT = np.asarray(
     [
-        [-258.60, -1163.75, +14.7188],
-        [+850.00,    +0.00,  -3.1169],
-        [  +0.00,    +0.00,  +0.7121],
+        [-206.0282, +894.0152, +14.7188],
+        [+616.1102,  -21.1683,  -3.1169],
+        [  +0.0000,   +0.0000,  +0.7121],
     ],
     dtype=np.float64,
 )
@@ -316,7 +317,7 @@ def main():
 
         print()
         print("==============================================================")
-        print("        TOTE ONE-SHOT ALIGN TEST")
+        print("        TOTE ONE-SHOT ALIGN TEST V2")
         print("==============================================================")
         print(f"Target TL    : ({TARGET_TL_X_PX:.3f}, {TARGET_TL_Y_PX:.3f}) px")
         print(f"Target angle : {TARGET_ANGLE_DEG:+.3f} deg")
