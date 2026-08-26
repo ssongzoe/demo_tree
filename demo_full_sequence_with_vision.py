@@ -37,7 +37,7 @@ TOTE_CAMERA_SERIAL = "250122079439"
 AR_CAMERA_SERIAL = "409122274689"
 MARKER_ID = 8
 
-DEFAULT_GRIPPER_TARGET = 0.35
+DEFAULT_GRIPPER_TARGET = 0.80
 DEFAULT_GRIPPER_TORQUE = 0.20
 
 
@@ -72,7 +72,7 @@ BEFORE_POSE = {
 # -----------------------------------------------------------------------------
 
 BACK_TARGET = (-0.10, 0.0, 0.0)
-TURN_TARGET = (-0.50, -0.05, math.radians(-185.43))
+TURN_TARGET = (-0.05, -0.05, math.radians(-180.43))
 STRAIGHT_TARGET = (0.75, 0.0, 0.0)
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
@@ -157,17 +157,12 @@ def detect_grasp_and_lift(
     show: bool,
 ) -> bool:
     """BEFORE 자세에서 tote를 인식해 base를 정렬한 뒤 GRASP로 진입하고, 그리퍼를 닫아 UP 자세로 들어 올린다."""
-    print("[1/6] BEFORE 자세로 이동")
-    if not move_to_upper_body_pose(robot, BEFORE_POSE, minimum_time=2.0):
-        print("BEFORE 자세 이동 실패")
-        return False
-
-    print("[2/6] BEFORE 자세에서 Tote 영상 인식 + one-shot 정렬")
+    print("[1/3] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
     if not align_tote(robot, monitor, camera_serial=tote_camera_serial, verify=True, show=show):
         print("Tote one-shot 정렬 실패")
         return False
 
-    print("[3/6] BEFORE → GRASP")
+    print("[2/3] BEFORE → GRASP")
     if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
         print("GRASP 자세 이동 실패")
         return False
@@ -176,7 +171,7 @@ def detect_grasp_and_lift(
     gripper.close(target=gripper_target, torque=gripper_torque, duration=1.0)
     print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
 
-    print("[4/6] GRASP → UP")
+    print("[3/3] GRASP → UP")
     if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=2.0):
         print("UP 자세 이동 실패")
         return False
