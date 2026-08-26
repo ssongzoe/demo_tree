@@ -66,11 +66,11 @@ UP_LEFT = np.deg2rad([-56.215, 32.642, 20.524, -39.767, 47.012, 73.780, 0.0]).to
 
 BACK_TARGET = (-0.10, 0.0, 0.0)
 TURN_TARGET = (-0.05, -0.05, math.radians(-180.43))
-STRAIGHT_TARGET = (0.45, 0.0, 0.0)
+STRAIGHT_TARGET = (0.65, 0.0, 0.0)
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 RETURN_TURN_TARGET = (0.0, 0.0, math.radians(179.43))
-RETURN_STRAIGHT_TARGET = (0.70, 0.0, 0.0)
+RETURN_STRAIGHT_TARGET = (0.82, 0.0, 0.0)
 
 
 def describe_target(target) -> str:
@@ -220,6 +220,7 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
         raise RuntimeError("복귀 주행 실패")
 
     print(f"{'=' * 24} CYCLE {cycle_index} DONE {'=' * 25}")
+    time.sleep(1.0)  # 다음 사이클 시작 전 잠시 대기
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="RB-Y1 tote vision full sequence 반복 데모")

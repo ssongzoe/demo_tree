@@ -158,25 +158,51 @@ def print_measurement(label: str, measurement: LeftMeasurement, error: PoseError
     print(f"error     : x={error.x_m * 100:+.2f} cm | y={error.y_m * 100:+.2f} cm | yaw={error.yaw_deg:+.3f} deg")
 
 
-def align_tote(
-    robot,
-    monitor: OdometryMonitor,
-    *,
-    camera_serial: str,
-    verify: bool = True,
-    show: bool = False,
-) -> bool:
-    """TOP + TL 한 번 측정으로 x/y/yaw를 동시에 보정하고 필요하면 최종 자세를 검증한다."""
-    pipeline = start_camera(camera_serial)
+class ToteAligner:
+    """D435 stream을 데모 시작부터 종료까지 유지하고, 필요할 때 fresh tote feature만 측정해 one-shot 정렬한다."""
 
-    try:
-        flush_camera(pipeline)
+    def __init__(self, camera_serial: str, show: bool = False):
+        self.camera_serial = camera_serial
+        self.show = show
+        self.pipeline = None
+
+    @property
+    def started(self) -> bool:
+        """D435 pipeline이 현재 실행 중인지 반환한다."""
+        return self.pipeline is not None
+
+    def start(self) -> None:
+        """D435를 한 번만 시작하며, 이후 여러 cycle에서 같은 stream을 계속 재사용한다."""
+        if self.started:
+            return
+
+        self.pipeline = start_camera(self.camera_serial)
+
+    def stop(self) -> None:
+        """실행 중인 D435 pipeline과 OpenCV 창을 종료한다."""
+        if self.pipeline is not None:
+            self.pipeline.stop()
+            self.pipeline = None
+
+        if self.show:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
+
+    def align(self, robot, monitor: OdometryMonitor, *, verify: bool = True) -> bool:
+        """현재 시점의 fresh TOP + TL feature를 측정해 x/y/yaw를 one-shot으로 보정하고 필요하면 최종 자세를 검증한다."""
+        if not self.started:
+            self.start()
+
+        # 이동 중 쌓인 frame은 버리고 현재 자세의 fresh frame만 사용한다.
+        flush_camera(self.pipeline)
 
         before = measure_left_feature(
-            pipeline,
+            self.pipeline,
             frame_count=MEASURE_FRAMES,
             timeout_s=MEASURE_TIMEOUT_S,
-            show=show,
+            show=self.show,
             label="BEFORE",
         )
 
@@ -207,13 +233,13 @@ def align_tote(
         if not verify:
             return True
 
-        flush_camera(pipeline)
+        flush_camera(self.pipeline)
 
         after = measure_left_feature(
-            pipeline,
+            self.pipeline,
             frame_count=MEASURE_FRAMES,
             timeout_s=MEASURE_TIMEOUT_S,
-            show=show,
+            show=self.show,
             label="AFTER",
         )
 
@@ -231,11 +257,20 @@ def align_tote(
         print("Tote one-shot 정렬 실패: 최종 오차가 grasp 허용 범위를 벗어났습니다.")
         return False
 
-    finally:
-        pipeline.stop()
 
-        if show:
-            try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
+def align_tote(
+    robot,
+    monitor: OdometryMonitor,
+    *,
+    camera_serial: str,
+    verify: bool = True,
+    show: bool = False,
+) -> bool:
+    """기존 단독 demo와의 호환용 함수이며, 한 번 호출할 때 D435 start → align → stop을 내부에서 수행한다."""
+    aligner = ToteAligner(camera_serial=camera_serial, show=show)
+
+    try:
+        aligner.start()
+        return aligner.align(robot, monitor, verify=verify)
+    finally:
+        aligner.stop()
