@@ -5,9 +5,9 @@
 0. Tote D435와 AR RealSense를 한 번만 시작하고 전체 반복 데모 동안 계속 streaming
 1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
 2. GRASP 자세로 진입한 뒤 그리퍼를 닫고 UP 자세로 들어 올림
-3. BACK_TARGET → TURN_TARGET → STRAIGHT_TARGET 순서로 기존 이송 경로 수행
+3. BACK 후 TURN과 동시에 torso DOWN + head 0 deg, 이어 STRAIGHT와 동시에 torso UP을 수행
 4. AR 마커 기준으로 배치 위치 정렬
-5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE 자세로 후퇴
+5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE + head 43 deg 자세로 동시에 복귀
 6. RETURN_BACK_TARGET → RETURN_TURN_TARGET → RETURN_STRAIGHT_TARGET 순서로 기존 복귀 경로 수행
 7. Tote / AR 카메라는 시작할 때 한 번만 켜고 계속 유지하며, 복귀가 끝나면 같은 과정을 즉시 다시 시작
 
@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import threading
 import time
 
 import numpy as np
 
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
-from control.robot_controller import move_both_arms
+from control.robot_controller import move_both_arms, move_to_upper_body_pose
 from skills.ar_align import ARAligner
 from skills.tote_align import ToteAligner
 
@@ -54,9 +55,38 @@ BEFORE_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.0
 GRASP_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
 GRASP_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
 
-UP_RIGHT = np.deg2rad([-56.214, -32.637, -20.526, -39.769, -47.012, 73.779, 0.001]).tolist()
-UP_LEFT = np.deg2rad([-56.215, 32.642, 20.524, -39.767, 47.012, 73.780, 0.0]).tolist()
+UP_RIGHT = np.deg2rad([-14.946, -30.981, -26.715, -102.267, -38.870, 97.751, -10.809]).tolist()
+UP_LEFT = np.deg2rad([-14.946, 30.981, 26.715, -102.267, 38.870, 97.751, 10.809]).tolist()
 
+TORSO_DOWN = np.deg2rad([0.0, 44.53, -75.01, 43.25, 0.0, 0.0]).tolist()
+TORSO_UP = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
+
+HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()
+HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()
+
+# 돌때 주저앉기
+TURN_UPPER_BODY_POSE = {
+    "torso": TORSO_DOWN,
+    "right_arm": UP_RIGHT,
+    "left_arm": UP_LEFT,
+    "head": HEAD_FORWARD,
+}
+
+#갈때 일어나기
+STRAIGHT_UPPER_BODY_POSE = {
+    "torso": TORSO_UP,
+    "right_arm": UP_RIGHT,
+    "left_arm": UP_LEFT,
+    "head": HEAD_FORWARD,
+}
+
+# 돌아가는길엔 일어나서 고개숙이고 가라
+BEFORE_POSE = {
+    "torso": TORSO_UP,
+    "right_arm": BEFORE_RIGHT,
+    "left_arm": BEFORE_LEFT,
+    "head": HEAD_DOWN,
+}
 
 # -----------------------------------------------------------------------------
 # 모바일 경로
@@ -71,6 +101,18 @@ STRAIGHT_TARGET = (0.65, 0.0, 0.0)
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 RETURN_TURN_TARGET = (0.0, 0.0, math.radians(179.43))
 RETURN_STRAIGHT_TARGET = (0.82, 0.0, 0.0)
+
+
+
+def move_upper_body_async(robot, pose, minimum_time: float, name: str) -> threading.Thread:
+    """상체 명령을 별도 thread에서 실행해 torso/head 움직임과 모바일 주행이 자연스럽게 겹치도록 한다."""
+    def worker():
+        if not move_to_upper_body_pose(robot, pose, minimum_time=minimum_time):
+            print(f"{name} 실패")
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread
 
 
 def describe_target(target) -> str:
@@ -95,18 +137,28 @@ def run_mobile_leg(robot, monitor, stream, step: str, target, duration: float, s
 
 
 def run_turn_and_go(robot, monitor) -> bool:
+    """BACK 후 TURN과 torso-down/head-up을 동시에 수행하고, STRAIGHT와 torso-up을 다시 동시에 수행한다."""
     stream = robot.create_command_stream(priority=10)
 
     try:
         if not run_mobile_leg(robot, monitor, stream, "이송 1/3", BACK_TARGET, 2.0, False, 0.0):
             return False
 
+        print("TURN 시작과 동시에 torso DOWN + head 0 deg")
+        turn_upper_thread = move_upper_body_async(robot, TURN_UPPER_BODY_POSE, minimum_time=2.0, name="TURN 상체 전환")
+
         if not run_mobile_leg(robot, monitor, stream, "이송 2/3", TURN_TARGET, 7.0, False, 0.0):
             return False
+
+        turn_upper_thread.join(timeout=0.1)
+
+        print("STRAIGHT 시작과 동시에 torso UP")
+        straight_upper_thread = move_upper_body_async(robot, STRAIGHT_UPPER_BODY_POSE, minimum_time=2.0, name="STRAIGHT 상체 전환")
 
         if not run_mobile_leg(robot, monitor, stream, "이송 3/3", STRAIGHT_TARGET, 5.0, True, 0.2):
             return False
 
+        straight_upper_thread.join(timeout=0.1)
         return True
 
     finally:
@@ -169,7 +221,7 @@ def detect_grasp_and_lift(
 
 
 def lower_release_and_retract(robot, gripper) -> bool:
-    """AR 정렬 후 UP에서 GRASP로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 BEFORE 자세로 양팔을 후퇴한다."""
+    """AR 정렬 후 UP → GRASP로 내려놓고 그리퍼를 연 뒤, BEFORE arms와 head 43 deg를 동시에 움직여 다음 cycle 시야를 준비한다."""
     print("[5/6] UP → GRASP")
     if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
         print("GRASP 자세 이동 실패")
@@ -178,9 +230,9 @@ def lower_release_and_retract(robot, gripper) -> bool:
     print("그리퍼 열기")
     gripper.open(duration=1.0)
 
-    print("GRASP → BEFORE")
-    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=2.0):
-        print("BEFORE 자세 이동 실패")
+    print("GRASP → BEFORE + head 43 deg")
+    if not move_to_upper_body_pose(robot, BEFORE_POSE, minimum_time=2.0):
+        print("BEFORE 자세 / head 복귀 실패")
         return False
 
     return True
