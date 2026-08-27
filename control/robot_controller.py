@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
-"""RB-Y1 상체 제어 모듈.
-
-rby1_sdk에서 사용하는 주요 제어
-- JointPositionCommandBuilder: 관절 목표 위치 명령 생성
-- BodyComponentBasedCommandBuilder: torso / 양팔 명령 구성
-- HeadCommandBuilder: head 명령 구성
-- RobotCommandBuilder: 최종 로봇 명령 생성
-- robot.send_command(): 상체 관절 명령 전송
-
-※ 로봇 연결 및 모바일 베이스 초기화는 mobile_controller.py에서 담당한다.
-"""
+"""RB-Y1 상체 제어 모듈."""
 
 import numpy as np
 import rby1_sdk as rby
 
 
 READY_POSE = {
-    "torso": np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist(),
+    "torso": np.deg2rad([0.0, 20.0, -45.0, 45.0, 0.0, 0.0]).tolist(),
     "right_arm": np.deg2rad([-10.0, -40.0, -5.0, -110.0, -35.0, 50.0, 0.0]).tolist(),
     "left_arm": np.deg2rad([-10.0, 40.0, -5.0, -110.0, 35.0, 50.0, 0.0]).tolist(),
-    "head": np.deg2rad([0.0, 43.0]).tolist(),
+    "head": np.deg2rad([0.0, 45.0]).tolist(),
 }
 
 READY_MINIMUM_TIME = 2.0
@@ -66,22 +56,10 @@ def move_to_upper_body_pose(robot, pose, minimum_time=2.0, timeout_ms=20000) -> 
 def move_to_ready_pose(robot) -> bool:
     """미리 정의된 READY 자세로 이동한다."""
     print("READY 자세로 이동")
-
-    return move_to_upper_body_pose(
-        robot,
-        READY_POSE,
-        minimum_time=READY_MINIMUM_TIME,
-        timeout_ms=READY_TIMEOUT_MS,
-    )
+    return move_to_upper_body_pose(robot, READY_POSE, minimum_time=READY_MINIMUM_TIME, timeout_ms=READY_TIMEOUT_MS)
 
 
-def move_both_arms(
-    robot,
-    right_position: np.ndarray,
-    left_position: np.ndarray,
-    minimum_time: float,
-    timeout_ms: int = 20000,
-) -> bool:
+def move_both_arms(robot, right_position: np.ndarray, left_position: np.ndarray, minimum_time: float, timeout_ms: int = 20000) -> bool:
     """torso와 head는 유지하고 양팔 관절 목표만 동시에 보낸다."""
     command = rby.RobotCommandBuilder().set_command(
         rby.ComponentBasedCommandBuilder().set_body_command(
@@ -100,5 +78,34 @@ def move_both_arms(
 
     feedback = handler.get()
     print(f"양팔 동작 완료: {feedback.finish_code}")
+    return feedback.finish_code == rby.RobotCommandFeedback.FinishCode.Ok
 
+
+def move_torso_and_head(
+    robot,
+    torso_position: np.ndarray,
+    head_position: np.ndarray,
+    minimum_time: float = 2.0,
+    timeout_ms: int = 20000,
+) -> bool:
+    """양팔은 유지하고 torso와 head 목표만 동시에 보내 perception 기준 자세를 맞춘다."""
+    command = rby.RobotCommandBuilder().set_command(
+        rby.ComponentBasedCommandBuilder()
+        .set_body_command(
+            rby.BodyComponentBasedCommandBuilder().set_torso_command(
+                _joint_position_command(torso_position, minimum_time)
+            )
+        )
+        .set_head_command(rby.HeadCommandBuilder(_joint_position_command(head_position, minimum_time)))
+    )
+
+    handler = robot.send_command(command)
+
+    if handler.wait_for(timeout_ms) is False:
+        handler.cancel()
+        handler.wait_for(2000)
+        return False
+
+    feedback = handler.get()
+    print(f"Torso / Head 동작 완료: {feedback.finish_code}")
     return feedback.finish_code == rby.RobotCommandFeedback.FinishCode.Ok

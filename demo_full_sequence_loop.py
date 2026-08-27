@@ -2,7 +2,7 @@
 """RB-Y1 tote 인식/파지, 모바일 이송, AR 정렬, 배치 및 복귀 통합 데모.
 
 동작 순서
-0. Tote D435와 AR RealSense를 한 번만 시작하고 전체 반복 데모 동안 계속 streaming
+0. torso / head를 calibration 기준 자세로 먼저 맞춘 뒤 Tote D435와 AR RealSense를 한 번만 시작하고 계속 streaming
 1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
 2. GRASP 자세로 진입한 뒤 그리퍼를 닫고 UP 자세로 들어 올림
 3. BACK_TARGET → TURN_TARGET → STRAIGHT_TARGET 순서로 기존 이송 경로 수행
@@ -24,7 +24,7 @@ import numpy as np
 
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
-from control.robot_controller import move_both_arms
+from control.robot_controller import move_both_arms, move_torso_and_head
 from skills.ar_align import ARAligner
 from skills.tote_align import ToteAligner
 
@@ -41,6 +41,10 @@ MARKER_ID = 8
 
 DEFAULT_GRIPPER_TARGET = 0.80
 DEFAULT_GRIPPER_TORQUE = 0.20
+
+# Tote vision과 grasp pose는 이 torso / head 기준으로 맞춰져 있으므로 프로그램 시작 시 한 번 정확히 고정한다.
+INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
+INITIAL_HEAD = np.deg2rad([0.0, 43.0]).tolist()
 
 
 # -----------------------------------------------------------------------------
@@ -153,7 +157,7 @@ def detect_grasp_and_lift(
         return False
 
     print("[2/3] 현재 자세 → GRASP")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=0.5):
+    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
         print("GRASP 자세 이동 실패")
         return False
 
@@ -259,6 +263,11 @@ def main() -> None:
 
         if not wait_for_odometry(monitor):
             raise RuntimeError("Odometry를 받지 못했습니다.")
+
+        # Tote 검출과 파지 자세가 torso/head 기준에 민감하므로 카메라 측정 전에 기준 자세를 한 번 확실하게 맞춘다.
+        print("초기 Torso / Head 기준 자세로 이동")
+        if not move_torso_and_head(robot, INITIAL_TORSO, INITIAL_HEAD, minimum_time=2.0):
+            raise RuntimeError("초기 Torso / Head 자세 이동 실패")
 
         # 두 RealSense는 프로그램 시작 시 한 번만 켜고 모든 cycle에서 stream을 계속 유지한다.
         print("Tote / AR 카메라 시작")
