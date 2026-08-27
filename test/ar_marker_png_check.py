@@ -7,7 +7,6 @@
 - 여러 개가 검출되면 영상에서 가장 크게 보이는 마커를 자동 선택
 """
 
-from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -16,16 +15,15 @@ import sys
 import cv2
 import numpy as np
 
-from utils.ar_marker import create_detector
-
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TEST_DIR = Path(__file__).resolve().parent
+
 
 for path in (PROJECT_ROOT, TEST_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+from utils.ar_marker import create_detector
 
 ARUCO_DICT = "DICT_APRILTAG_36h11"
 
