@@ -20,6 +20,7 @@ python test/tote_corner_calibration_test.py --serial 250122079439
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import math
@@ -86,6 +87,8 @@ MIN_SIDE_EDGE_SUPPORT = 0.35
 WINDOW_NAME = "Tote Corner Calibration"
 EDGES_WINDOW_NAME = "Edges"
 MAX_HISTORY = 300
+TIMING_HISTORY_SIZE = 300
+PRINT_TIMING_EVERY_N_FRAMES = 30
 
 
 @dataclass
@@ -581,6 +584,35 @@ def print_array_stats(name: str, values: list[float], unit: str) -> None:
     )
 
 
+
+def print_timing_stats(detect_times_ms, frame_wait_times_ms) -> None:
+    """최근 frame의 detector 연산 시간과 RealSense frame 대기 시간을 분리해서 출력한다."""
+    if not detect_times_ms:
+        print("시간 측정값이 없습니다.")
+        return
+
+    detect = np.asarray(detect_times_ms, dtype=np.float64)
+    wait = np.asarray(frame_wait_times_ms, dtype=np.float64) if frame_wait_times_ms else np.asarray([], dtype=np.float64)
+
+    print()
+    print("=" * 96)
+    print(f"최근 {len(detect)} frame 시간 통계")
+    print(
+        f"Detector    : mean={np.mean(detect):7.2f} ms | median={np.median(detect):7.2f} ms | "
+        f"P90={np.percentile(detect, 90):7.2f} ms | max={np.max(detect):7.2f} ms"
+    )
+
+    if wait.size:
+        print(
+            f"Camera wait : mean={np.mean(wait):7.2f} ms | median={np.median(wait):7.2f} ms | "
+            f"P90={np.percentile(wait, 90):7.2f} ms | max={np.max(wait):7.2f} ms"
+        )
+
+    print(f"Detector FPS equivalent: {1000.0 / np.mean(detect):.1f} FPS")
+    print("=" * 96)
+    print()
+
+
 def print_stats(history: list[FrameFeature]) -> None:
     """최근 history에서 LEFT / RIGHT feature 통계를 각각 출력한다."""
     if not history:
@@ -647,6 +679,10 @@ def main():
     save_dir = Path(args.save_dir)
     pipeline = start_camera(args.serial)
     history: list[FrameFeature] = []
+    detect_times_ms = deque(maxlen=TIMING_HISTORY_SIZE)
+    frame_wait_times_ms = deque(maxlen=TIMING_HISTORY_SIZE)
+    frame_index = 0
+
     last_output = None
     last_edges = None
 
@@ -654,7 +690,7 @@ def main():
     print("TOP + 한쪽 corner calibration")
     print("정답 자세 / X± / Y± / Yaw± 각 위치에서 r -> 잠시 대기 -> p")
     print()
-    print("p: 최근 측정 통계")
+    print("p: 최근 측정 + detector 시간 통계")
     print("r: 측정값 초기화")
     print("s: 현재 화면 저장")
     print("q / ESC: 종료")
@@ -662,15 +698,29 @@ def main():
 
     try:
         while True:
+            wait_start = time.perf_counter()
             frames = pipeline.wait_for_frames()
+            frame_wait_times_ms.append((time.perf_counter() - wait_start) * 1000.0)
+
             color_frame = frames.get_color_frame()
 
             if not color_frame:
                 continue
 
             image = np.asarray(color_frame.get_data())
+
+            detect_start = time.perf_counter()
             feature, edges = detect_frame_feature_with_edges(image)
+            detect_times_ms.append((time.perf_counter() - detect_start) * 1000.0)
+
             output = draw_feature(image, feature)
+            frame_index += 1
+
+            if frame_index % PRINT_TIMING_EVERY_N_FRAMES == 0:
+                print(
+                    f"Detection timing | current={detect_times_ms[-1]:.2f} ms | "
+                    f"mean={np.mean(detect_times_ms):.2f} ms | median={np.median(detect_times_ms):.2f} ms"
+                )
 
             if feature is not None:
                 history.append(feature)
@@ -693,9 +743,12 @@ def main():
 
             if key == ord("r"):
                 history.clear()
-                print("측정값 초기화")
+                detect_times_ms.clear()
+                frame_wait_times_ms.clear()
+                print("측정값 / 시간 통계 초기화")
             elif key == ord("p"):
                 print_stats(history)
+                print_timing_stats(detect_times_ms, frame_wait_times_ms)
             elif key == ord("s") and last_output is not None:
                 save_dir.mkdir(parents=True, exist_ok=True)
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
