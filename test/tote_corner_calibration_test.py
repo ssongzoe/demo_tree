@@ -73,6 +73,7 @@ MIN_SIDE_EDGE_SUPPORT = 0.35
 
 # 화면 / 통계
 WINDOW_NAME = "Tote Corner Calibration"
+EDGES_WINDOW_NAME = "Edges"
 MAX_HISTORY = 300
 
 
@@ -400,22 +401,30 @@ def choose_right_corner(top: LineCandidate, candidates: list[LineCandidate], edg
     return max(valid, key=lambda item: item.point[0]) if valid else None
 
 
-def detect_frame_feature(image: np.ndarray) -> FrameFeature | None:
-    """TOP을 먼저 찾고 LEFT / RIGHT corner를 서로 독립적으로 검출한다."""
+def detect_frame_feature_with_edges(image: np.ndarray) -> tuple[FrameFeature | None, np.ndarray]:
+    """TOP / TL / TR을 검출하고 같은 frame에서 사용한 Canny edge 영상도 함께 반환한다."""
     gray, edges = preprocess(image)
     top = detect_top(gray, edges)
 
     if top is None:
-        return None
+        return None, edges
 
     left_candidates, right_candidates = detect_side_candidates(edges)
 
-    return FrameFeature(
+    feature = FrameFeature(
         top=top,
         top_angle_deg=normalize_angle(top.angle_deg),
         left=choose_left_corner(top, left_candidates, edges),
         right=choose_right_corner(top, right_candidates, edges),
     )
+
+    return feature, edges
+
+
+def detect_frame_feature(image: np.ndarray) -> FrameFeature | None:
+    """기존 calibration / one-shot 코드와의 호환성을 유지하면서 TOP / TL / TR feature만 반환한다."""
+    feature, _ = detect_frame_feature_with_edges(image)
+    return feature
 
 
 def draw_feature(image: np.ndarray, feature: FrameFeature | None) -> np.ndarray:
@@ -532,6 +541,7 @@ def main():
     pipeline = start_camera(args.serial)
     history: list[FrameFeature] = []
     last_output = None
+    last_edges = None
 
     print()
     print("TOP + 한쪽 corner calibration")
@@ -552,7 +562,7 @@ def main():
                 continue
 
             image = np.asarray(color_frame.get_data())
-            feature = detect_frame_feature(image)
+            feature, edges = detect_frame_feature_with_edges(image)
             output = draw_feature(image, feature)
 
             if feature is not None:
@@ -560,7 +570,15 @@ def main():
                 history = history[-MAX_HISTORY:]
 
             last_output = output
+            last_edges = edges
+
             cv2.imshow(WINDOW_NAME, output)
+            cv2.imshow(EDGES_WINDOW_NAME, edges)
+
+            # 보고서 캡처가 편하도록 검출 화면과 edge 화면을 좌우로 배치한다.
+            cv2.moveWindow(WINDOW_NAME, 0, 0)
+            cv2.moveWindow(EDGES_WINDOW_NAME, CAM_WIDTH + 10, 0)
+
             key = cv2.waitKey(1) & 0xFF
 
             if key in (ord("q"), 27):
@@ -573,9 +591,19 @@ def main():
                 print_stats(history)
             elif key == ord("s") and last_output is not None:
                 save_dir.mkdir(parents=True, exist_ok=True)
-                path = save_dir / f"tote_corner_{time.strftime('%Y%m%d_%H%M%S')}.png"
-                cv2.imwrite(str(path), last_output)
-                print(f"저장: {path}")
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                result_path = save_dir / f"tote_corner_{timestamp}.png"
+                edges_path = save_dir / f"tote_corner_edges_{timestamp}.png"
+
+                cv2.imwrite(str(result_path), last_output)
+
+                if last_edges is not None:
+                    cv2.imwrite(str(edges_path), last_edges)
+
+                print(f"저장: {result_path}")
+
+                if last_edges is not None:
+                    print(f"저장: {edges_path}")
 
     finally:
         pipeline.stop()

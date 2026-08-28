@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TOP rim과 왼쪽/오른쪽 위 모서리를 독립적으로 측정하는 calibration 전용 테스트.
+"""물건이 많이 찬 tote에서도 TOP fragment merge와 outer-corner validation으로 TL/TR을 안정적으로 측정하는 테스트.
 
 목적
 - LEFT feature  = [TL.x, TL.y, top_angle]
@@ -43,10 +43,15 @@ HOUGH_THRESHOLD = 45
 MAX_LINE_GAP = 40
 
 # TOP rim
-TOP_MIN_LINE_LENGTH = 100
+# 물건이 rim 가까이 올라오면 TOP edge가 여러 Hough segment로 끊길 수 있으므로 짧은 조각도 후보에 넣고 같은 rim끼리 묶어 다시 fitting한다.
+TOP_FRAGMENT_MIN_LINE_LENGTH = 60
+TOP_MIN_FITTED_LENGTH = 100
 TOP_MIN_Y = 55
 TOP_MAX_Y = 175
 TOP_MAX_ANGLE_DEG = 12.0
+
+TOP_GROUP_Y_TOL_PX = 10.0
+TOP_GROUP_ANGLE_TOL_DEG = 3.0
 
 CONTRAST_OFFSET_PX = 10
 CONTRAST_SAMPLE_COUNT = 20
@@ -66,6 +71,12 @@ MAX_RIGHT_CANDIDATES = 6
 # Corner geometry / edge support
 CORNER_MARGIN_RATIO = 0.06
 SIDE_PROBE_HEIGHT_RATIO = 0.30
+
+# 내부 물건 edge가 side 후보로 들어와도 실제 tote 바깥 corner와 너무 멀면 제거한다.
+LEFT_CORNER_MAX_X_RATIO = 0.40
+RIGHT_CORNER_MIN_X_RATIO = 0.60
+MIN_TOP_WIDTH_RATIO = 0.55
+MAX_TOP_WIDTH_RATIO = 1.10
 
 EDGE_SAMPLE_COUNT = 20
 EDGE_SEARCH_RADIUS = 4
@@ -195,6 +206,42 @@ def line_y_at_x(segment: np.ndarray, x: float) -> float | None:
     return y1 + (float(x) - x1) * (y2 - y1) / (x2 - x1)
 
 
+def angle_difference_deg(first: float, second: float) -> float:
+    """수평 기준 두 line angle의 최소 차이를 계산한다."""
+    return abs(normalize_angle(float(first) - float(second)))
+
+
+def fit_top_group(group: list[LineCandidate]) -> LineCandidate | None:
+    """같은 TOP rim에 속한 Hough 조각들의 endpoint를 cv2.fitLine으로 합쳐 하나의 긴 TOP line을 만든다."""
+    points = []
+
+    for candidate in group:
+        x1, y1, x2, y2 = candidate.segment
+        points.append([x1, y1])
+        points.append([x2, y2])
+
+    if len(points) < 4:
+        return None
+
+    points = np.asarray(points, dtype=np.float32)
+    vx, vy, fit_x, fit_y = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
+
+    if abs(vx) < 1e-8:
+        return None
+
+    left_x = float(np.min(points[:, 0]))
+    right_x = float(np.max(points[:, 0]))
+    left_y = float(fit_y + (left_x - fit_x) * vy / vx)
+    right_y = float(fit_y + (right_x - fit_x) * vy / vx)
+
+    fitted = make_candidate(np.asarray([left_x, left_y, right_x, right_y], dtype=np.float64))
+
+    if fitted.length < TOP_MIN_FITTED_LENGTH:
+        return None
+
+    return fitted
+
+
 def preprocess(image: np.ndarray):
     """gray / edge 영상을 만든다."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -240,7 +287,7 @@ def top_contrast(gray: np.ndarray, segment: np.ndarray) -> float:
 
 
 def detect_top(gray: np.ndarray, edges: np.ndarray) -> LineCandidate | None:
-    """기존 V2와 같은 방식으로 TOP rim 하나를 선택한다."""
+    """TOP Hough 조각들을 y/angle 기준으로 묶고 fitLine으로 합쳐 가장 넓고 안정적인 TOP rim 하나를 선택한다."""
     roi_edges = np.zeros_like(edges)
     roi_edges[TOP_MIN_Y:TOP_MAX_Y, :] = edges[TOP_MIN_Y:TOP_MAX_Y, :]
 
@@ -249,15 +296,14 @@ def detect_top(gray: np.ndarray, edges: np.ndarray) -> LineCandidate | None:
         rho=1,
         theta=np.pi / 180.0,
         threshold=HOUGH_THRESHOLD,
-        minLineLength=TOP_MIN_LINE_LENGTH,
+        minLineLength=TOP_FRAGMENT_MIN_LINE_LENGTH,
         maxLineGap=MAX_LINE_GAP,
     )
 
     if detected is None:
         return None
 
-    best = None
-    best_score = -float("inf")
+    candidates = []
 
     for segment in np.asarray(detected, dtype=np.int32).reshape(-1, 4):
         candidate = make_candidate(segment)
@@ -266,12 +312,56 @@ def detect_top(gray: np.ndarray, edges: np.ndarray) -> LineCandidate | None:
         if abs(angle_deg) > TOP_MAX_ANGLE_DEG or not TOP_MIN_Y <= candidate.center_y <= TOP_MAX_Y:
             continue
 
-        length_score = candidate.length / CAM_WIDTH
-        contrast_score = np.clip(top_contrast(gray, candidate.segment) / 80.0, -1.0, 1.0)
-        score = 0.70 * length_score + 0.30 * contrast_score
+        candidates.append(candidate)
+
+    if not candidates:
+        return None
+
+    best = None
+    best_score = -float("inf")
+    image_center_x = 0.5 * CAM_WIDTH
+
+    for anchor in candidates:
+        anchor_y = line_y_at_x(anchor.segment, image_center_x)
+
+        if anchor_y is None:
+            continue
+
+        group = []
+
+        for candidate in candidates:
+            candidate_y = line_y_at_x(candidate.segment, image_center_x)
+
+            if candidate_y is None:
+                continue
+
+            if abs(candidate_y - anchor_y) > TOP_GROUP_Y_TOL_PX:
+                continue
+
+            if angle_difference_deg(candidate.angle_deg, anchor.angle_deg) > TOP_GROUP_ANGLE_TOL_DEG:
+                continue
+
+            group.append(candidate)
+
+        fitted = fit_top_group(group)
+
+        if fitted is None:
+            continue
+
+        angle_deg = normalize_angle(fitted.angle_deg)
+
+        if abs(angle_deg) > TOP_MAX_ANGLE_DEG or not TOP_MIN_Y <= fitted.center_y <= TOP_MAX_Y:
+            continue
+
+        coverage_score = min(1.0, fitted.length / (CAM_WIDTH * 0.80))
+        fragment_score = min(1.0, sum(item.length for item in group) / CAM_WIDTH)
+        contrast_score = np.clip(top_contrast(gray, fitted.segment) / 80.0, -1.0, 1.0)
+        group_score = min(1.0, len(group) / 4.0)
+
+        score = 0.50 * coverage_score + 0.20 * fragment_score + 0.20 * contrast_score + 0.10 * group_score
 
         if score > best_score:
-            best = candidate
+            best = fitted
             best_score = score
 
     return best
@@ -355,6 +445,12 @@ def build_corner(top: LineCandidate, side: LineCandidate, edges: np.ndarray, is_
     if point is None or not valid_corner(point, width, height):
         return None
 
+    if is_left and point[0] > width * LEFT_CORNER_MAX_X_RATIO:
+        return None
+
+    if not is_left and point[0] < width * RIGHT_CORNER_MIN_X_RATIO:
+        return None
+
     probe_y = min(height * 0.90, point[1] + height * SIDE_PROBE_HEIGHT_RATIO)
     probe_x = line_x_at_y(side.line_abc, probe_y)
 
@@ -411,11 +507,22 @@ def detect_frame_feature_with_edges(image: np.ndarray) -> tuple[FrameFeature | N
 
     left_candidates, right_candidates = detect_side_candidates(edges)
 
+    left = choose_left_corner(top, left_candidates, edges)
+    right = choose_right_corner(top, right_candidates, edges)
+
+    # 양쪽 corner가 모두 검출된 경우 실제 tote TOP 폭과 너무 다른 조합은 내부 물건 edge 오검출로 보고 버린다.
+    if left is not None and right is not None:
+        top_width = float(np.linalg.norm(right.point - left.point))
+
+        if not CAM_WIDTH * MIN_TOP_WIDTH_RATIO <= top_width <= CAM_WIDTH * MAX_TOP_WIDTH_RATIO:
+            left = None
+            right = None
+
     feature = FrameFeature(
         top=top,
         top_angle_deg=normalize_angle(top.angle_deg),
-        left=choose_left_corner(top, left_candidates, edges),
-        right=choose_right_corner(top, right_candidates, edges),
+        left=left,
+        right=right,
     )
 
     return feature, edges
