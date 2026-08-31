@@ -25,7 +25,7 @@ CAM_HEIGHT = 480
 CAM_FPS = 30
 
 # 실제 배치 목표 위치에서 측정한 marker pose
-TARGET_MARKER_POS = np.array([0.025, 0.069, 0.255], dtype=np.float64)
+TARGET_MARKER_POS = np.array([0.025, 0.069, 0.20], dtype=np.float64)
 TARGET_MARKER_YAW_DEG = 1.74
 
 POSITION_TOL = 0.01

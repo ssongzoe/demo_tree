@@ -64,6 +64,7 @@ UP_LEFT = np.deg2rad([-20.43, 25.28, 27.43, -98.12, 52.06, 91.75, 15.12]).tolist
 HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
 HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
 HEAD_MOVE_TIME = 2.0
+ARM_UP_MOVE_TIME = 2.0
 
 
 
@@ -78,8 +79,8 @@ TURN_TARGET = (-0.05, -0.05, math.radians(-180.43))
 STRAIGHT_TARGET = (0.65, 0.0, 0.0)
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
-RETURN_TURN_TARGET = (0.0, 0.0, math.radians(179.43))
-RETURN_STRAIGHT_TARGET = (0.82, 0.0, 0.0)
+RETURN_TURN_TARGET = (0.0, 0.0, math.radians(181.43))
+RETURN_STRAIGHT_TARGET = (0.88, 0.0, 0.0)
 
 # ------------------------------------------------------------------
 ###############           각 액션 정의             #################
@@ -142,6 +143,41 @@ def finish_pending_head_move(future: Future | None, description: str) -> None:
         wait_for_head_move(future, description)
 
 
+def move_arms_async(robot, right_arm, left_arm, description: str) -> Future:
+    """양팔 명령을 별도 thread에서 실행해 모바일 회전과 겹친다."""
+    future = Future()
+
+    def worker():
+        try:
+            success = move_both_arms(robot, right_arm, left_arm, minimum_time=ARM_UP_MOVE_TIME)
+            future.set_result(success)
+        except Exception as error:  # SDK 명령 예외는 메인 시퀀스에서 처리할 수 있도록 Future로 전달한다.
+            future.set_exception(error)
+
+    print(description)
+    threading.Thread(target=worker, name="arm-pose", daemon=True).start()
+    return future
+
+
+def wait_for_arm_move(future: Future, description: str) -> bool:
+    """동시에 실행한 양팔 이동이 끝났는지 다음 주행 구간 전에 확인한다."""
+    try:
+        if future.result():
+            return True
+    except Exception as error:
+        print(f"{description} 예외: {error}")
+        return False
+
+    print(f"{description} 실패")
+    return False
+
+
+def finish_pending_arm_move(future: Future | None, description: str) -> None:
+    """복귀 주행 중 예외가 나더라도 이미 시작한 양팔 명령이 끝날 때까지 정리한다."""
+    if future is not None:
+        wait_for_arm_move(future, description)
+
+
 def run_turn_and_go(robot, monitor) -> bool:
     """후진과 회전 후, Head를 들면서 배치 위치까지 직진한다."""
     stream = robot.create_command_stream(priority=10)
@@ -168,9 +204,10 @@ def run_turn_and_go(robot, monitor) -> bool:
 
 
 def run_return_route(robot, monitor) -> bool:
-    """배치 후 Head를 숙이면서 RETURN_BACK → RETURN_TURN → RETURN_STRAIGHT 경로로 복귀한다."""
+    """배치 후 Head를 숙이고, 회전 중 양팔을 UP으로 올리며 복귀한다."""
     stream = robot.create_command_stream(priority=10)
     head_move = None
+    arm_move = None
 
     try:
         head_move = move_head_async(robot, HEAD_DOWN, "복귀 1/3과 동시에 다음 Tote 인식을 위해 Head 숙이기")
@@ -182,6 +219,14 @@ def run_return_route(robot, monitor) -> bool:
 
         route_ok = True
         for step, target, duration, stop_at_end, settle in legs:
+            if step == "복귀 2/3":
+                arm_move = move_arms_async(
+                    robot,
+                    UP_RIGHT,
+                    UP_LEFT,
+                    "복귀 2/3과 동시에 양팔을 UP 자세로 이동",
+                )
+
             if not run_mobile_leg(robot, monitor, stream, step, target, duration, stop_at_end, settle):
                 print(f"{step} 실패: {describe_target(target)}")
                 route_ok = False
@@ -189,10 +234,13 @@ def run_return_route(robot, monitor) -> bool:
 
         head_ok = wait_for_head_move(head_move, "Head Tote 인식 자세 이동")
         head_move = None
-        return route_ok and head_ok
+        arm_ok = True if arm_move is None else wait_for_arm_move(arm_move, "양팔 UP 자세 이동")
+        arm_move = None
+        return route_ok and head_ok and arm_ok
 
     finally:
         finish_pending_head_move(head_move, "Head Tote 인식 자세 이동")
+        finish_pending_arm_move(arm_move, "양팔 UP 자세 이동")
         stream.cancel()
         stream.wait_for(500)
 
@@ -344,10 +392,15 @@ def main() -> None:
         if not wait_for_odometry(monitor):
             raise RuntimeError("Odometry를 받지 못했습니다.")
 
-        # Tote 검출과 파지 자세가 torso/head 기준에 민감하므로 카메라 측정 전에 기준 자세를 한 번 확실하게 맞춘다.
-        print("초기 Torso / Head 기준 자세로 이동")
-        if not move_torso_and_head(robot, INITIAL_TORSO, HEAD_DOWN, minimum_time=2.0):
-            raise RuntimeError("초기 Torso / Head 자세 이동 실패")
+        # Torso / Head와 양팔은 서로 간섭하지 않으므로 카메라 측정 전에 동시에 기준 자세로 이동한다.
+        initial_head_move = move_head_async(robot, HEAD_DOWN, "초기 Torso / Head 기준 자세로 이동")
+        initial_arm_move = move_arms_async(robot, BEFORE_RIGHT, BEFORE_LEFT, "초기 양팔 BEFORE 자세로 이동")
+
+        initial_head_ok = wait_for_head_move(initial_head_move, "초기 Torso / Head 자세 이동")
+        initial_arm_ok = wait_for_arm_move(initial_arm_move, "초기 양팔 BEFORE 자세 이동")
+
+        if not initial_head_ok or not initial_arm_ok:
+            raise RuntimeError("초기 Torso / Head 또는 양팔 BEFORE 자세 이동 실패")
 
         print(f"Head 공용 카메라 시작: serial={args.camera_serial}, {CAM_WIDTH}x{CAM_HEIGHT}@{CAM_FPS}")
         head_camera.start()
