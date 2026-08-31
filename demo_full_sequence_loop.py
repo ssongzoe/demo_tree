@@ -5,29 +5,30 @@
 0. torso / head를 calibration 기준 자세로 먼저 맞춘 뒤 Tote D435와 AR RealSense를 한 번만 시작하고 계속 streaming
 1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
 2. GRASP 자세로 진입한 뒤 그리퍼를 닫고 UP 자세로 들어 올림
-3. BACK_TARGET → TURN_TARGET → STRAIGHT_TARGET 순서로 기존 이송 경로 수행
+3. BACK_TARGET → TURN_TARGET 이동 후 STRAIGHT_TARGET 직진과 동시에 Head를 정면 자세로 전환
 4. AR 마커 기준으로 배치 위치 정렬
 5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE 자세로 후퇴
-6. RETURN_BACK_TARGET → RETURN_TURN_TARGET → RETURN_STRAIGHT_TARGET 순서로 기존 복귀 경로 수행
+6. 복귀 주행과 동시에 Head를 다시 Tote 인식 자세로 숙임
 7. Tote / AR 카메라는 시작할 때 한 번만 켜고 계속 유지하며, 복귀가 끝나면 같은 과정을 즉시 다시 시작
+8. 로봇 상태는 기존 SDK callback에서 WCS publisher에도 전달하고, 작업 상태와 함께 별도 스레드에서 주기 전송
 
 이동 거리와 회전각은 아래 target 상수만 수정하면 되며, 실행 로그는 target 값을 직접 읽어 출력하므로 값과 설명이 따로 어긋나지 않는다.
 """
 
-from __future__ import annotations
-
 import argparse
 import math
+import threading
 import time
+from concurrent.futures import Future
 
 import numpy as np
 
+from communication.wcs.publisher import WcsPublisher
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_head
 from skills.ar_align import ARAligner
 from skills.tote_align import ToteAligner
-
 
 # -----------------------------------------------------------------------------
 # 로봇 / 카메라 설정
@@ -42,9 +43,8 @@ MARKER_ID = 8
 DEFAULT_GRIPPER_TARGET = 0.80
 DEFAULT_GRIPPER_TORQUE = 0.20
 
-# Tote vision과 grasp pose는 이 torso / head 기준으로 맞춰져 있으므로 프로그램 시작 시 한 번 정확히 고정한다.
+# Tote vision과 grasp pose는 이 torso 기준으로 맞춰져 있으므로 프로그램 시작 시 한 번 정확히 고정한다.
 INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
-INITIAL_HEAD = np.deg2rad([0.0, 43.0]).tolist()
 
 
 # -----------------------------------------------------------------------------
@@ -61,6 +61,10 @@ GRASP_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.03
 UP_RIGHT = np.deg2rad([-20.43, -25.28, -27.43, -98.12, -52.06, 91.75, -15.12]).tolist()
 UP_LEFT = np.deg2rad([-20.43, 25.28, 27.43, -98.12, 52.06, 91.75, 15.12]).tolist()
 
+HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
+HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
+HEAD_MOVE_TIME = 2.0
+
 
 
 # -----------------------------------------------------------------------------
@@ -76,6 +80,10 @@ STRAIGHT_TARGET = (0.65, 0.0, 0.0)
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 RETURN_TURN_TARGET = (0.0, 0.0, math.radians(179.43))
 RETURN_STRAIGHT_TARGET = (0.82, 0.0, 0.0)
+
+# ------------------------------------------------------------------
+###############           각 액션 정의             #################
+# ------------------------------------------------------------------
 
 
 def describe_target(target) -> str:
@@ -99,8 +107,45 @@ def run_mobile_leg(robot, monitor, stream, step: str, target, duration: float, s
     return move_leg(robot, monitor, leg, settle=settle, stream=stream, stop_at_end=stop_at_end)
 
 
+def move_head_async(robot, head_pose, description: str) -> Future:
+    """Torso 기준은 유지하면서 Head 명령을 별도 thread에서 실행해 모바일 주행과 겹친다."""
+    future = Future()
+
+    def worker():
+        try:
+            success = move_torso_and_head(robot, INITIAL_TORSO, head_pose, minimum_time=HEAD_MOVE_TIME)
+            future.set_result(success)
+        except Exception as error:  # SDK 명령 예외는 메인 시퀀스에서 처리할 수 있도록 Future로 전달한다.
+            future.set_exception(error)
+
+    print(description)
+    threading.Thread(target=worker, name="head-pose", daemon=True).start()
+    return future
+
+
+def wait_for_head_move(future: Future, description: str) -> bool:
+    """동시에 실행한 Head 이동 결과를 다음 카메라 인식 또는 사이클 시작 전에 확인한다."""
+    try:
+        if future.result():
+            return True
+    except Exception as error:
+        print(f"{description} 예외: {error}")
+        return False
+
+    print(f"{description} 실패")
+    return False
+
+
+def finish_pending_head_move(future: Future | None, description: str) -> None:
+    """모바일 이동 중 예외가 나더라도 이미 시작한 Head 명령이 끝날 때까지 정리한다."""
+    if future is not None:
+        wait_for_head_move(future, description)
+
+
 def run_turn_and_go(robot, monitor) -> bool:
+    """후진과 회전 후, Head를 들면서 배치 위치까지 직진한다."""
     stream = robot.create_command_stream(priority=10)
+    head_move = None
 
     try:
         if not run_mobile_leg(robot, monitor, stream, "이송 1/3", BACK_TARGET, 2.0, False, 0.0):
@@ -109,35 +154,45 @@ def run_turn_and_go(robot, monitor) -> bool:
         if not run_mobile_leg(robot, monitor, stream, "이송 2/3", TURN_TARGET, 7.0, False, 0.0):
             return False
 
-        if not run_mobile_leg(robot, monitor, stream, "이송 3/3", STRAIGHT_TARGET, 5.0, True, 0.2):
-            return False
+        head_move = move_head_async(robot, HEAD_FORWARD, "이송 3/3과 동시에 정면 AR 인식을 위해 Head 들기")
+        straight_ok = run_mobile_leg(robot, monitor, stream, "이송 3/3", STRAIGHT_TARGET, 5.0, True, 0.2)
+        head_ok = wait_for_head_move(head_move, "Head 정면 자세 이동")
+        head_move = None
 
-        return True
+        return straight_ok and head_ok
 
     finally:
+        finish_pending_head_move(head_move, "Head 정면 자세 이동")
         stream.cancel()
         stream.wait_for(500)
 
 
 def run_return_route(robot, monitor) -> bool:
-    """박스를 놓고 팔을 BEFORE로 후퇴한 뒤 RETURN_BACK → RETURN_TURN → RETURN_STRAIGHT target을 기존 설정 그대로 수행한다."""
+    """배치 후 Head를 숙이면서 RETURN_BACK → RETURN_TURN → RETURN_STRAIGHT 경로로 복귀한다."""
     stream = robot.create_command_stream(priority=10)
+    head_move = None
 
     try:
+        head_move = move_head_async(robot, HEAD_DOWN, "복귀 1/3과 동시에 다음 Tote 인식을 위해 Head 숙이기")
         legs = [
             ("복귀 1/3", RETURN_BACK_TARGET, 3.0, False, 0.0),
             ("복귀 2/3", RETURN_TURN_TARGET, 10.0, False, 0.0),
             ("복귀 3/3", RETURN_STRAIGHT_TARGET, 5.0, True, 0.2),
         ]
 
+        route_ok = True
         for step, target, duration, stop_at_end, settle in legs:
             if not run_mobile_leg(robot, monitor, stream, step, target, duration, stop_at_end, settle):
                 print(f"{step} 실패: {describe_target(target)}")
-                return False
+                route_ok = False
+                break
 
-        return True
+        head_ok = wait_for_head_move(head_move, "Head Tote 인식 자세 이동")
+        head_move = None
+        return route_ok and head_ok
 
     finally:
+        finish_pending_head_move(head_move, "Head Tote 인식 자세 이동")
         stream.cancel()
         stream.wait_for(500)
 
@@ -189,6 +244,12 @@ def lower_release_and_retract(robot, gripper) -> bool:
         return False
 
     return True
+
+
+
+# -------------------------------------------------------------------
+###############           반복 시퀀스 정의            #################
+# -------------------------------------------------------------------
 
 
 
@@ -246,10 +307,17 @@ def main() -> None:
     tote_aligner = ToteAligner(camera_serial=args.tote_camera_serial, show=args.show_tote)
     ar_aligner = ARAligner(marker_id=args.marker_id, camera_serial=args.ar_camera_serial)
     monitor = OdometryMonitor()
+    wcs_publisher = WcsPublisher(robot_model=robot.model())
     state_update_started = False
+    wcs_publisher_started = False
     completed_cycles = 0
 
     try:
+        # 초기 상태를 먼저 설정한다. RobotState가 들어오면 publisher가 최신 상태와 함께 WCS로 전송한다.
+        wcs_publisher.set_work_state("IDLE")
+        wcs_publisher.start()
+        wcs_publisher_started = True
+
         robot.set_tool_flange_output_voltage("right", 12)
         robot.set_tool_flange_output_voltage("left", 12)
         time.sleep(0.5)
@@ -258,7 +326,12 @@ def main() -> None:
         gripper.connect()
         gripper.open(duration=2.0)
 
-        robot.start_state_update(monitor.on_state, rate=50)
+        # SDK state 구독은 한 번만 시작하고, 같은 state를 오도메트리와 WCS 상태 저장부에 함께 전달한다.
+        def on_robot_state(state, *callback_args):
+            monitor.on_state(state, *callback_args)
+            wcs_publisher.on_state(state, *callback_args)
+
+        robot.start_state_update(on_robot_state, rate=50)
         state_update_started = True
 
         if not wait_for_odometry(monitor):
@@ -266,7 +339,7 @@ def main() -> None:
 
         # Tote 검출과 파지 자세가 torso/head 기준에 민감하므로 카메라 측정 전에 기준 자세를 한 번 확실하게 맞춘다.
         print("초기 Torso / Head 기준 자세로 이동")
-        if not move_torso_and_head(robot, INITIAL_TORSO, INITIAL_HEAD, minimum_time=2.0):
+        if not move_torso_and_head(robot, INITIAL_TORSO, HEAD_DOWN, minimum_time=2.0):
             raise RuntimeError("초기 Torso / Head 자세 이동 실패")
 
         # 두 RealSense는 프로그램 시작 시 한 번만 켜고 모든 cycle에서 stream을 계속 유지한다.
@@ -277,19 +350,30 @@ def main() -> None:
         cycle_index = 1
 
         while args.cycles == 0 or cycle_index <= args.cycles:
+            wcs_publisher.set_work_state("WORKING")
             run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_index)
+            wcs_publisher.set_work_state("DONE")
             completed_cycles += 1
             cycle_index += 1
 
         print(f"요청한 {completed_cycles}개 사이클 완료")
 
     except KeyboardInterrupt:
+        wcs_publisher.set_work_state("IDLE")
         print(f"\n사용자가 반복 데모를 중단했습니다. 완료 사이클: {completed_cycles}")
 
     except Exception as error:
+        wcs_publisher.set_work_state("ERROR", str(error))
         print(f"반복 데모 실패: {error} | 완료 사이클: {completed_cycles}")
 
     finally:
+        # DONE / ERROR처럼 짧게 유지될 수 있는 마지막 상태를 즉시 한 번 전송한 뒤 publisher를 종료한다.
+        if wcs_publisher_started:
+            try:
+                wcs_publisher.stop(flush=True)
+            except Exception as error:
+                print(f"WCS publisher 종료 실패: {error}")
+
         tote_aligner.stop()
         ar_aligner.stop()
 
