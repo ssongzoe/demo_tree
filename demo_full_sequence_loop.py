@@ -4,7 +4,7 @@
 동작 순서
 0. torso / head를 calibration 기준 자세로 먼저 맞춘 뒤, main에서 Head RealSense pipeline을 한 번만 시작해 Tote/AR가 함께 사용
 1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
-2. GRASP 자세로 진입한 뒤 그리퍼를 닫고 UP 자세로 들어 올림
+2. Tote 정렬 후 양팔을 BEFORE → GRASP로 이동한 뒤 그리퍼를 닫고 UP 자세로 들어 올림
 3. BACK_TARGET → TURN_TARGET 이동 후 STRAIGHT_TARGET 직진과 동시에 Head를 정면 자세로 전환
 4. AR 마커 기준으로 배치 위치 정렬
 5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE 자세로 후퇴
@@ -209,11 +209,10 @@ def run_turn_and_go(robot, monitor) -> bool:
 
 
 def run_return_route(robot, monitor) -> bool:
-    """배치 후 Head를 숙이고, 회전 중 팔을 UP으로 올린 뒤 마지막 직진 중 BEFORE로 복귀한다."""
+    """배치 후 Head를 숙이고, 회전 중 양팔을 UP으로 올린 상태로 복귀를 완료한다."""
     stream = robot.create_command_stream(priority=10)
     head_move = None
     arm_up_move = None
-    arm_before_move = None
 
     try:
         head_move = move_head_async(robot, HEAD_DOWN, "복귀 1/3과 동시에 다음 Tote 인식을 위해 Head 숙이기")
@@ -233,21 +232,6 @@ def run_return_route(robot, monitor) -> bool:
                     "복귀 2/3과 동시에 양팔을 UP 자세로 이동",
                 )
 
-            if step == "복귀 3/3":
-                # 회전 중 UP 이동이 완료된 것을 확인한 뒤, 마지막 직진과 동시에 다음 cycle용 BEFORE 자세로 내린다.
-                if arm_up_move is not None:
-                    if not wait_for_arm_move(arm_up_move, "양팔 UP 자세 이동"):
-                        arm_up_move = None
-                        return False
-                    arm_up_move = None
-
-                arm_before_move = move_arms_async(
-                    robot,
-                    BEFORE_RIGHT,
-                    BEFORE_LEFT,
-                    "복귀 3/3과 동시에 양팔을 BEFORE 자세로 이동",
-                )
-
             if not run_mobile_leg(robot, monitor, stream, step, target, duration, stop_at_end, settle):
                 print(f"{step} 실패: {describe_target(target)}")
                 route_ok = False
@@ -255,16 +239,13 @@ def run_return_route(robot, monitor) -> bool:
 
         head_ok = wait_for_head_move(head_move, "Head Tote 인식 자세 이동")
         head_move = None
-        arm_before_ok = (
-            True if arm_before_move is None else wait_for_arm_move(arm_before_move, "양팔 BEFORE 자세 이동")
-        )
-        arm_before_move = None
-        return route_ok and head_ok and arm_before_ok
+        arm_up_ok = True if arm_up_move is None else wait_for_arm_move(arm_up_move, "양팔 UP 자세 이동")
+        arm_up_move = None
+        return route_ok and head_ok and arm_up_ok
 
     finally:
         finish_pending_head_move(head_move, "Head Tote 인식 자세 이동")
         finish_pending_arm_move(arm_up_move, "양팔 UP 자세 이동")
-        finish_pending_arm_move(arm_before_move, "양팔 BEFORE 자세 이동")
         stream.cancel()
         stream.wait_for(500)
 
@@ -277,13 +258,18 @@ def detect_grasp_and_lift(
     gripper_target: float,
     gripper_torque: float,
 ) -> bool:
-    """현재 자세에서 tote를 인식해 base를 정렬한 뒤 GRASP로 진입하고, 그리퍼를 닫아 UP 자세로 들어 올린다."""
-    print("[1/3] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
+    """Tote를 정렬한 뒤 양팔을 BEFORE → GRASP → UP 순서로 이동해 파지한다."""
+    print("[1/4] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
     if not tote_aligner.align(robot, monitor, verify=True):
         print("Tote one-shot 정렬 실패")
         return False
 
-    print("[2/3] 현재 자세 → GRASP")
+    print("[2/4] 현재 자세 → BEFORE")
+    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=2.0):
+        print("BEFORE 자세 이동 실패")
+        return False
+
+    print("[3/4] BEFORE → GRASP")
     if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
         print("GRASP 자세 이동 실패")
         return False
@@ -292,7 +278,7 @@ def detect_grasp_and_lift(
     gripper.close(target=gripper_target, torque=gripper_torque, duration=1.0)
     print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
 
-    print("[3/3] GRASP → UP")
+    print("[4/4] GRASP → UP")
     if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.0):
         print("UP 자세 이동 실패")
         return False
@@ -416,15 +402,10 @@ def main() -> None:
         if not wait_for_odometry(monitor):
             raise RuntimeError("Odometry를 받지 못했습니다.")
 
-        # Torso / Head와 양팔은 서로 간섭하지 않으므로 카메라 측정 전에 동시에 기준 자세로 이동한다.
+        # 초기에는 Tote 시야를 위한 Torso / Head만 기준 자세로 맞춘다. 양팔 BEFORE 이동은 Tote 정렬 후에 수행한다.
         initial_head_move = move_head_async(robot, HEAD_DOWN, "초기 Torso / Head 기준 자세로 이동")
-        initial_arm_move = move_arms_async(robot, BEFORE_RIGHT, BEFORE_LEFT, "초기 양팔 BEFORE 자세로 이동")
-
-        initial_head_ok = wait_for_head_move(initial_head_move, "초기 Torso / Head 자세 이동")
-        initial_arm_ok = wait_for_arm_move(initial_arm_move, "초기 양팔 BEFORE 자세 이동")
-
-        if not initial_head_ok or not initial_arm_ok:
-            raise RuntimeError("초기 Torso / Head 또는 양팔 BEFORE 자세 이동 실패")
+        if not wait_for_head_move(initial_head_move, "초기 Torso / Head 자세 이동"):
+            raise RuntimeError("초기 Torso / Head 자세 이동 실패")
 
         print(
             f"Head 공용 카메라 시작: serial={args.camera_serial}, "
