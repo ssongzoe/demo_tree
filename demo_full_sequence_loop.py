@@ -27,7 +27,7 @@ from communication.wcs.publisher import WcsPublisher
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_head
-from skills.ar_align import ARAligner, CAM_FPS, CAM_HEIGHT, CAM_WIDTH
+from skills.ar_align import ARAligner
 from skills.tote_align import ToteAligner
 from utils.ar_marker import RealSenseCamera
 
@@ -39,6 +39,11 @@ ADDRESS = "192.168.30.1:50051"
 
 HEAD_CAMERA_SERIAL = "250122079439"
 MARKER_ID = 8
+
+# Tote 검출 보정은 이 Head 카메라 모드에서 수행했다. AR은 주입받은 카메라의 실제 intrinsic을 사용한다.
+HEAD_CAM_WIDTH = 640
+HEAD_CAM_HEIGHT = 480
+HEAD_CAM_FPS = 30
 
 DEFAULT_GRIPPER_TARGET = 0.80
 DEFAULT_GRIPPER_TORQUE = 0.20
@@ -204,10 +209,11 @@ def run_turn_and_go(robot, monitor) -> bool:
 
 
 def run_return_route(robot, monitor) -> bool:
-    """배치 후 Head를 숙이고, 회전 중 양팔을 UP으로 올리며 복귀한다."""
+    """배치 후 Head를 숙이고, 회전 중 팔을 UP으로 올린 뒤 마지막 직진 중 BEFORE로 복귀한다."""
     stream = robot.create_command_stream(priority=10)
     head_move = None
-    arm_move = None
+    arm_up_move = None
+    arm_before_move = None
 
     try:
         head_move = move_head_async(robot, HEAD_DOWN, "복귀 1/3과 동시에 다음 Tote 인식을 위해 Head 숙이기")
@@ -220,11 +226,26 @@ def run_return_route(robot, monitor) -> bool:
         route_ok = True
         for step, target, duration, stop_at_end, settle in legs:
             if step == "복귀 2/3":
-                arm_move = move_arms_async(
+                arm_up_move = move_arms_async(
                     robot,
                     UP_RIGHT,
                     UP_LEFT,
                     "복귀 2/3과 동시에 양팔을 UP 자세로 이동",
+                )
+
+            if step == "복귀 3/3":
+                # 회전 중 UP 이동이 완료된 것을 확인한 뒤, 마지막 직진과 동시에 다음 cycle용 BEFORE 자세로 내린다.
+                if arm_up_move is not None:
+                    if not wait_for_arm_move(arm_up_move, "양팔 UP 자세 이동"):
+                        arm_up_move = None
+                        return False
+                    arm_up_move = None
+
+                arm_before_move = move_arms_async(
+                    robot,
+                    BEFORE_RIGHT,
+                    BEFORE_LEFT,
+                    "복귀 3/3과 동시에 양팔을 BEFORE 자세로 이동",
                 )
 
             if not run_mobile_leg(robot, monitor, stream, step, target, duration, stop_at_end, settle):
@@ -234,13 +255,16 @@ def run_return_route(robot, monitor) -> bool:
 
         head_ok = wait_for_head_move(head_move, "Head Tote 인식 자세 이동")
         head_move = None
-        arm_ok = True if arm_move is None else wait_for_arm_move(arm_move, "양팔 UP 자세 이동")
-        arm_move = None
-        return route_ok and head_ok and arm_ok
+        arm_before_ok = (
+            True if arm_before_move is None else wait_for_arm_move(arm_before_move, "양팔 BEFORE 자세 이동")
+        )
+        arm_before_move = None
+        return route_ok and head_ok and arm_before_ok
 
     finally:
         finish_pending_head_move(head_move, "Head Tote 인식 자세 이동")
-        finish_pending_arm_move(arm_move, "양팔 UP 자세 이동")
+        finish_pending_arm_move(arm_up_move, "양팔 UP 자세 이동")
+        finish_pending_arm_move(arm_before_move, "양팔 BEFORE 자세 이동")
         stream.cancel()
         stream.wait_for(500)
 
@@ -357,7 +381,7 @@ def main() -> None:
     robot = initialize_mobile(args.address, args.model, power=".*", servo=".*", unlimited=False)
 
     gripper = None
-    head_camera = RealSenseCamera(CAM_WIDTH, CAM_HEIGHT, CAM_FPS, serial=args.camera_serial)
+    head_camera = RealSenseCamera(HEAD_CAM_WIDTH, HEAD_CAM_HEIGHT, HEAD_CAM_FPS, serial=args.camera_serial)
     tote_aligner = ToteAligner(camera=head_camera, show=args.show_tote)
     ar_aligner = ARAligner(marker_id=args.marker_id, camera=head_camera)
     monitor = OdometryMonitor()
@@ -402,7 +426,10 @@ def main() -> None:
         if not initial_head_ok or not initial_arm_ok:
             raise RuntimeError("초기 Torso / Head 또는 양팔 BEFORE 자세 이동 실패")
 
-        print(f"Head 공용 카메라 시작: serial={args.camera_serial}, {CAM_WIDTH}x{CAM_HEIGHT}@{CAM_FPS}")
+        print(
+            f"Head 공용 카메라 시작: serial={args.camera_serial}, "
+            f"{HEAD_CAM_WIDTH}x{HEAD_CAM_HEIGHT}@{HEAD_CAM_FPS}"
+        )
         head_camera.start()
         head_camera_started = True
 

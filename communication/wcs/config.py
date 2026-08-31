@@ -37,4 +37,4 @@ ROBOT_SERIAL = os.getenv("ROBOT_SERIAL", "RBY1-001")
 UPLOAD_RATE_HZ = _positive_float("UPLOAD_RATE_HZ", 1.0)
 
 # 실제 POST 없이 payload만 로그로 확인할 때 사용한다.
-DRY_RUN = _bool("DRY_RUN", False)
+DRY_RUN = _bool("DRY_RUN", False) #False
