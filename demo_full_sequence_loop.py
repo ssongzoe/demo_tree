@@ -2,14 +2,14 @@
 """RB-Y1 tote 인식/파지, 모바일 이송, AR 정렬, 배치 및 복귀 통합 데모.
 
 동작 순서
-0. torso / head를 calibration 기준 자세로 먼저 맞춘 뒤 Tote D435와 AR RealSense를 한 번만 시작하고 계속 streaming
+0. torso / head를 calibration 기준 자세로 먼저 맞춘 뒤, main에서 Head RealSense pipeline을 한 번만 시작해 Tote/AR가 함께 사용
 1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
 2. GRASP 자세로 진입한 뒤 그리퍼를 닫고 UP 자세로 들어 올림
 3. BACK_TARGET → TURN_TARGET 이동 후 STRAIGHT_TARGET 직진과 동시에 Head를 정면 자세로 전환
 4. AR 마커 기준으로 배치 위치 정렬
 5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE 자세로 후퇴
 6. 복귀 주행과 동시에 Head를 다시 Tote 인식 자세로 숙임
-7. Tote / AR 카메라는 시작할 때 한 번만 켜고 계속 유지하며, 복귀가 끝나면 같은 과정을 즉시 다시 시작
+7. Head RealSense pipeline의 start / stop 소유권은 main에만 두고, Tote / AR aligner는 전달받은 공용 stream에서 frame만 읽음
 8. 로봇 상태는 기존 SDK callback에서 WCS publisher에도 전달하고, 작업 상태와 함께 별도 스레드에서 주기 전송
 
 이동 거리와 회전각은 아래 target 상수만 수정하면 되며, 실행 로그는 target 값을 직접 읽어 출력하므로 값과 설명이 따로 어긋나지 않는다.
@@ -27,8 +27,9 @@ from communication.wcs.publisher import WcsPublisher
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_head
-from skills.ar_align import ARAligner
+from skills.ar_align import ARAligner, CAM_FPS, CAM_HEIGHT, CAM_WIDTH
 from skills.tote_align import ToteAligner
+from utils.ar_marker import RealSenseCamera
 
 # -----------------------------------------------------------------------------
 # 로봇 / 카메라 설정
@@ -36,8 +37,7 @@ from skills.tote_align import ToteAligner
 
 ADDRESS = "192.168.30.1:50051"
 
-TOTE_CAMERA_SERIAL = "250122079439"
-AR_CAMERA_SERIAL = "409122274689"
+HEAD_CAMERA_SERIAL = "250122079439"
 MARKER_ID = 8
 
 DEFAULT_GRIPPER_TARGET = 0.80
@@ -293,8 +293,13 @@ def main() -> None:
     parser.add_argument("--address", default=ADDRESS, help="로봇 주소")
     parser.add_argument("--model", choices=("a", "m"), default="m", help="RB-Y1 모델")
     parser.add_argument("--marker-id", type=int, default=MARKER_ID, help="배치 위치 정렬에 사용할 AR 마커 ID")
-    parser.add_argument("--tote-camera-serial", default=TOTE_CAMERA_SERIAL, help="Tote 인식/정렬용 D435 serial")
-    parser.add_argument("--ar-camera-serial", default=AR_CAMERA_SERIAL, help="AR 마커 정렬용 RealSense serial")
+    parser.add_argument(
+        "--camera-serial",
+        "--tote-camera-serial",
+        dest="camera_serial",
+        default=HEAD_CAMERA_SERIAL,
+        help="Tote/AR 인식에 공용으로 사용할 Head RealSense serial",
+    )
     parser.add_argument("--show-tote", action="store_true", help="Tote 검출 OpenCV 화면 표시")
     parser.add_argument("--gripper-target", type=float, default=DEFAULT_GRIPPER_TARGET, help="그리퍼 닫힘 위치")
     parser.add_argument("--gripper-torque", type=float, default=DEFAULT_GRIPPER_TORQUE, help="그리퍼 파지 토크 [Nm]")
@@ -304,12 +309,14 @@ def main() -> None:
     robot = initialize_mobile(args.address, args.model, power=".*", servo=".*", unlimited=False)
 
     gripper = None
-    tote_aligner = ToteAligner(camera_serial=args.tote_camera_serial, show=args.show_tote)
-    ar_aligner = ARAligner(marker_id=args.marker_id, camera_serial=args.ar_camera_serial)
+    head_camera = RealSenseCamera(CAM_WIDTH, CAM_HEIGHT, CAM_FPS, serial=args.camera_serial)
+    tote_aligner = ToteAligner(camera=head_camera, show=args.show_tote)
+    ar_aligner = ARAligner(marker_id=args.marker_id, camera=head_camera)
     monitor = OdometryMonitor()
     wcs_publisher = WcsPublisher(robot_model=robot.model())
     state_update_started = False
     wcs_publisher_started = False
+    head_camera_started = False
     completed_cycles = 0
 
     try:
@@ -342,10 +349,9 @@ def main() -> None:
         if not move_torso_and_head(robot, INITIAL_TORSO, HEAD_DOWN, minimum_time=2.0):
             raise RuntimeError("초기 Torso / Head 자세 이동 실패")
 
-        # 두 RealSense는 프로그램 시작 시 한 번만 켜고 모든 cycle에서 stream을 계속 유지한다.
-        print("Tote / AR 카메라 시작")
-        tote_aligner.start()
-        ar_aligner.start()
+        print(f"Head 공용 카메라 시작: serial={args.camera_serial}, {CAM_WIDTH}x{CAM_HEIGHT}@{CAM_FPS}")
+        head_camera.start()
+        head_camera_started = True
 
         cycle_index = 1
 
@@ -374,8 +380,11 @@ def main() -> None:
             except Exception as error:
                 print(f"WCS publisher 종료 실패: {error}")
 
-        tote_aligner.stop()
-        ar_aligner.stop()
+        if head_camera_started:
+            try:
+                head_camera.stop()
+            except Exception as error:
+                print(f"Head 공용 카메라 종료 실패: {error}")
 
         if state_update_started:
             try:

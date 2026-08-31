@@ -159,30 +159,44 @@ def print_measurement(label: str, measurement: LeftMeasurement, error: PoseError
 
 
 class ToteAligner:
-    """D435 stream을 데모 시작부터 종료까지 유지하고, 필요할 때 fresh tote feature만 측정해 one-shot 정렬한다."""
+    """자체 pipeline 또는 main에서 주입한 공용 카메라 pipeline으로 tote를 one-shot 정렬한다."""
 
-    def __init__(self, camera_serial: str, show: bool = False):
+    def __init__(self, camera_serial: str | None = None, show: bool = False, *, camera=None):
+        if camera is None and not camera_serial:
+            raise ValueError("camera_serial 또는 공용 camera 중 하나가 필요합니다.")
+
         self.camera_serial = camera_serial
         self.show = show
-        self.pipeline = None
+        self._camera = camera
+        self._pipeline = None
+
+    @property
+    def pipeline(self):
+        """공용 camera를 사용하면 현재 camera.pipeline을 동적으로 반환한다."""
+        if self._camera is not None:
+            return self._camera.pipeline
+        return self._pipeline
 
     @property
     def started(self) -> bool:
-        """D435 pipeline이 현재 실행 중인지 반환한다."""
+        """측정에 사용할 pipeline 객체가 준비됐는지 반환한다."""
         return self.pipeline is not None
 
     def start(self) -> None:
-        """D435를 한 번만 시작하며, 이후 여러 cycle에서 같은 stream을 계속 재사용한다."""
+        """단독 사용 시에만 D435를 시작한다. 공용 camera의 start는 main이 담당한다."""
         if self.started:
             return
 
-        self.pipeline = start_camera(self.camera_serial)
+        if self._camera is not None:
+            raise RuntimeError("공용 camera pipeline이 시작되지 않았습니다. main()에서 먼저 camera.start() 하세요.")
+
+        self._pipeline = start_camera(self.camera_serial)
 
     def stop(self) -> None:
-        """실행 중인 D435 pipeline과 OpenCV 창을 종료한다."""
-        if self.pipeline is not None:
-            self.pipeline.stop()
-            self.pipeline = None
+        """단독 사용 시에만 pipeline을 종료하며, 공용 camera는 main의 소유로 남긴다."""
+        if self._camera is None and self._pipeline is not None:
+            self._pipeline.stop()
+            self._pipeline = None
 
         if self.show:
             try:

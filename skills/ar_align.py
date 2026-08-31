@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """AR 마커 기준 모바일 베이스 one-shot 정렬 skill.
 
-마커 카메라는 주행 중 미리 켜둘 수 있으며, 정렬 시점에는 fresh frame만 짧게 모아 x / y / yaw를 한 번에 보정한다.
+마커 카메라는 주행 중 미리 켜둘 수 있으며, main에서 주입한 공용 카메라를 사용할 수도 있다.
+정렬 시점에는 fresh frame만 짧게 모아 x / y / yaw를 한 번에 보정한다.
 기존 yaw 이동 → 재측정 → 위치 이동 구조와 달리 실제 로봇 이동은 한 번만 수행한다.
 """
 
@@ -19,9 +20,9 @@ ARUCO_DICT = "DICT_APRILTAG_36h11"
 MARKER_SIZE = 0.08
 MARKER_SCALE = 0.8
 
-CAM_WIDTH = 848
+CAM_WIDTH = 640
 CAM_HEIGHT = 480
-CAM_FPS = 15
+CAM_FPS = 30
 
 # 실제 배치 목표 위치에서 측정한 marker pose
 TARGET_MARKER_POS = np.array([0.025, 0.069, 0.255], dtype=np.float64)
@@ -37,7 +38,7 @@ QUINTIC_PEAK = 1.875
 MIN_LEG_TIME = 1.5
 SETTLE_S = 0.2
 
-# 카메라를 이미 켜둔 상태에서 이동 후 쌓인 frame은 조금만 버리고, fresh detection 4개 median으로 빠르게 측정한다.
+# Tote calibration과 같은 640x480@30 공용 stream에서, 이동 후 쌓인 frame은 조금만 버리고 fresh detection 4개를 측정한다.
 MEASURE_FRAMES = 4
 FLUSH_FRAMES = 2
 MEASURE_TIMEOUT_S = 2.0
@@ -89,41 +90,51 @@ def _move_relative(robot, monitor, x: float, y: float, theta: float, duration: f
 
 
 class ARAligner:
-    """카메라를 미리 시작해 두고 필요할 때 fresh marker pose만 빠르게 측정하여 one-shot 정렬하는 객체."""
+    """자체 카메라 또는 main에서 주입한 공용 카메라로 fresh marker pose를 측정해 one-shot 정렬한다."""
 
     def __init__(
         self,
         marker_id,
         camera_serial=None,
+        *,
+        camera=None,
         target_marker_pos=TARGET_MARKER_POS,
         target_marker_yaw_deg=TARGET_MARKER_YAW_DEG,
     ):
+        if camera is not None and camera_serial is not None:
+            raise ValueError("공용 camera 사용 시 camera_serial은 함께 지정할 수 없습니다.")
+
         self.marker_id = marker_id
         self.target_marker_pos = np.asarray(target_marker_pos, dtype=np.float64)
         self.target_marker_yaw_deg = float(target_marker_yaw_deg)
 
         self.detector = create_detector(ARUCO_DICT)
         self.pnp_size = MARKER_SIZE * MARKER_SCALE
-        self.camera = RealSenseCamera(CAM_WIDTH, CAM_HEIGHT, CAM_FPS, serial=camera_serial)
+        self._owns_camera = camera is None
+        self.camera = camera if camera is not None else RealSenseCamera(CAM_WIDTH, CAM_HEIGHT, CAM_FPS, serial=camera_serial)
         self.started = False
 
     def start(self) -> None:
-        """AR 카메라를 한 번만 시작하며, 이후 주행 중에도 stream을 유지해 정렬 직전 startup 시간을 없앤다."""
+        """단독 사용 시에만 AR 카메라를 시작한다. 공용 camera의 start는 main이 담당한다."""
         if self.started:
             return
 
-        start_time = time.perf_counter()
-        print("AR 카메라 미리 시작")
-        self.camera.start()
+        if self._owns_camera:
+            start_time = time.perf_counter()
+            print("AR 카메라 미리 시작")
+            self.camera.start()
+            print(f"AR 카메라 시작 완료: {time.perf_counter() - start_time:.3f} s")
+
         self.started = True
-        print(f"AR 카메라 시작 완료: {time.perf_counter() - start_time:.3f} s")
 
     def stop(self) -> None:
-        """시작된 AR 카메라 stream을 종료한다."""
+        """단독 사용 시에만 AR 카메라 stream을 종료한다."""
         if not self.started:
             return
 
-        self.camera.stop()
+        if self._owns_camera:
+            self.camera.stop()
+
         self.started = False
 
     def _measure(self):
