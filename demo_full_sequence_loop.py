@@ -60,11 +60,21 @@ INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 BEFORE_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
 BEFORE_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
 
+
+# BEFORE_RIGHT = np.deg2rad([-50.821, -43.007, -16.543, -42.856, -31.054, 61.499, 0.017]).tolist()
+# BEFORE_LEFT = np.deg2rad([-50.821, 43.007, 16.543, -42.856, 31.054, 61.499, 0.017]).tolist()
+
+AFTER_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
+AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
+
 GRASP_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
 GRASP_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
 
 UP_RIGHT = np.deg2rad([-20.43, -25.28, -27.43, -98.12, -52.06, 91.75, -15.12]).tolist()
 UP_LEFT = np.deg2rad([-20.43, 25.28, 27.43, -98.12, 52.06, 91.75, 15.12]).tolist()
+
+BACK_RIGHT = np.deg2rad([-17.36, -31.32, -35.09, -99.56, -59.69, 98.00, -13.33]).tolist()
+BACK_LEFT = np.deg2rad([-17.36, 31.32, 35.09, -99.56, 59.69, 98.00, 13.33]).tolist()
 
 HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
 HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
@@ -85,7 +95,7 @@ STRAIGHT_TARGET = (0.65, 0.0, 0.0)
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 RETURN_TURN_TARGET = (0.0, 0.0, math.radians(181.43))
-RETURN_STRAIGHT_TARGET = (0.88, 0.0, 0.0)
+RETURN_STRAIGHT_TARGET = (0.95, 0.0, 0.0)
 
 # ------------------------------------------------------------------
 ###############           각 액션 정의             #################
@@ -215,7 +225,7 @@ def run_return_route(robot, monitor) -> bool:
     arm_up_move = None
 
     try:
-        head_move = move_head_async(robot, HEAD_DOWN, "복귀 1/3과 동시에 다음 Tote 인식을 위해 Head 숙이기")
+        
         legs = [
             ("복귀 1/3", RETURN_BACK_TARGET, 3.0, False, 0.0),
             ("복귀 2/3", RETURN_TURN_TARGET, 10.0, False, 0.0),
@@ -227,8 +237,8 @@ def run_return_route(robot, monitor) -> bool:
             if step == "복귀 2/3":
                 arm_up_move = move_arms_async(
                     robot,
-                    UP_RIGHT,
-                    UP_LEFT,
+                    BACK_RIGHT,
+                    BACK_LEFT,
                     "복귀 2/3과 동시에 양팔을 UP 자세로 이동",
                 )
 
@@ -236,6 +246,8 @@ def run_return_route(robot, monitor) -> bool:
                 print(f"{step} 실패: {describe_target(target)}")
                 route_ok = False
                 break
+
+        head_move = move_head_async(robot, HEAD_DOWN, "복귀 1/3과 동시에 다음 Tote 인식을 위해 Head 숙이기")
 
         head_ok = wait_for_head_move(head_move, "Head Tote 인식 자세 이동")
         head_move = None
@@ -259,12 +271,14 @@ def detect_grasp_and_lift(
     gripper_torque: float,
 ) -> bool:
     """Tote를 정렬한 뒤 양팔을 BEFORE → GRASP → UP 순서로 이동해 파지한다."""
-    print("[1/4] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
+
+
+    print("[2/4] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
     if not tote_aligner.align(robot, monitor, verify=True):
         print("Tote one-shot 정렬 실패")
         return False
 
-    print("[2/4] 현재 자세 → BEFORE")
+    print("[1/4] 현재 자세 → BEFORE")
     if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=2.0):
         print("BEFORE 자세 이동 실패")
         return False
@@ -297,7 +311,7 @@ def lower_release_and_retract(robot, gripper) -> bool:
     gripper.open(duration=1.0)
 
     print("GRASP → BEFORE")
-    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=2.0):
+    if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=2.0):
         print("BEFORE 자세 이동 실패")
         return False
 
