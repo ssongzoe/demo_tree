@@ -109,15 +109,15 @@ TURN_TARGET = (-0.05, -0.05, math.radians(-180.43))
 STRAIGHT_TARGET = (0.65, 0.0, 0.0)
 
 OUTBOUND_DIRECT_TARGET = compose_relative_targets(BACK_TARGET, TURN_TARGET, STRAIGHT_TARGET)
-OUTBOUND_DIRECT_DURATION = 12.5
-OUTBOUND_HEAD_DELAY = 9.0
+OUTBOUND_DIRECT_DURATION = 8.0
+OUTBOUND_HEAD_DELAY = 3.0
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
-RETURN_TURN_TARGET = (0.0, 0.0, math.radians(181.43))
+RETURN_TURN_TARGET = (0.0, 0.0, math.radians(183.43))
 RETURN_STRAIGHT_TARGET = (0.95, 0.0, 0.0)
 
 RETURN_TURN_AND_STRAIGHT_TARGET = compose_relative_targets(RETURN_TURN_TARGET, RETURN_STRAIGHT_TARGET)
-RETURN_TURN_AND_STRAIGHT_DURATION = 15.0
+RETURN_TURN_AND_STRAIGHT_DURATION = 9.0
 
 # ------------------------------------------------------------------
 ###############           각 액션 정의             #################
@@ -316,21 +316,21 @@ def detect_grasp_and_lift(
         return False
 
     print("[1/4] 현재 자세 → BEFORE")
-    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=2.0):
+    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.0):
         print("BEFORE 자세 이동 실패")
         return False
 
     print("[3/4] BEFORE → GRASP")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
+    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=0.8):
         print("GRASP 자세 이동 실패")
         return False
 
     print(f"그리퍼 닫기: target={gripper_target:.2f}, torque={gripper_torque:.2f} Nm")
-    gripper.close(target=gripper_target, torque=gripper_torque, duration=1.0)
+    gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
     print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
 
     print("[4/4] GRASP → UP")
-    if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.0):
+    if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.2):
         print("UP 자세 이동 실패")
         return False
 
@@ -348,7 +348,7 @@ def lower_release_and_retract(robot, gripper) -> bool:
     gripper.open(duration=1.0)
 
     print("GRASP → BEFORE")
-    if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=2.0):
+    if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=1.0):
         print("BEFORE 자세 이동 실패")
         return False
 

@@ -35,7 +35,7 @@ VERTICAL_WARN_M = 0.05
 ALIGN_LINEAR_SPEED = 0.15
 ALIGN_ANGULAR_SPEED = 0.5
 QUINTIC_PEAK = 1.875
-MIN_LEG_TIME = 1.5
+MIN_LEG_TIME = 1.0
 SETTLE_S = 0.2
 
 # Tote calibration과 같은 640x480@30 공용 stream에서, 이동 후 쌓인 frame은 조금만 버리고 fresh detection 4개를 측정한다.
