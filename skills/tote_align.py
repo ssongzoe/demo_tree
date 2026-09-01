@@ -26,10 +26,10 @@ from control.mobile_controller import OdometryMonitor, build_leg, move_leg, odom
 from utils.tote_vision import LeftMeasurement, flush_camera, measure_left_feature, start_camera
 
 
-# 정답 grasp 자세
-TARGET_TL_X_PX = 94.088
-TARGET_TL_Y_PX = 114.000
-TARGET_ANGLE_DEG = 0.000
+# 새 grasp 성공 자세의 Robust detector median
+TARGET_TL_X_PX = 83.363
+TARGET_TL_Y_PX = 145.913
+TARGET_ANGLE_DEG = -1.190
 
 # 자동 calibration 결과
 # row    = [TL.x(px), TL.y(px), top_angle(deg)]
