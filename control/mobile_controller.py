@@ -144,6 +144,16 @@ def compose_pose(base, relative):
     )
 
 
+def compose_relative_targets(*targets):
+    """여러 body-frame 상대 target을 하나의 최종 상대 target으로 합성한다."""
+    result = (0.0, 0.0, 0.0)
+
+    for target in targets:
+        result = compose_pose(result, target)
+
+    return result
+
+
 # ============================================================
 # Trajectory
 # ============================================================
@@ -173,6 +183,39 @@ def build_leg(start, target, absolute, duration, turn_direction):
         dth=dth,
         duration=duration,
     )
+
+
+def build_route(start, targets, durations, *, absolute=False, turn_directions=None):
+    """여러 target을 하나의 연속 경로로 추종할 수 있도록 odom 기준 leg 목록으로 변환한다."""
+    if len(targets) != len(durations):
+        raise ValueError("targets와 durations 길이가 같아야 합니다.")
+
+    if not targets:
+        raise ValueError("경로에는 target이 하나 이상 필요합니다.")
+
+    if turn_directions is None:
+        turn_directions = ["shortest"] * len(targets)
+    elif len(turn_directions) != len(targets):
+        raise ValueError("turn_directions와 targets 길이가 같아야 합니다.")
+
+    legs = []
+    current = start
+
+    for target, duration, turn_direction in zip(targets, durations, turn_directions):
+        if duration <= 0.0:
+            raise ValueError("각 구간의 duration은 0보다 커야 합니다.")
+
+        leg = build_leg(
+            start=current,
+            target=target,
+            absolute=absolute,
+            duration=duration,
+            turn_direction=turn_direction,
+        )
+        legs.append(leg)
+        current = (leg.x1, leg.y1, leg.th0 + leg.dth)
+
+    return legs
 
 
 def quintic(tau):
@@ -305,5 +348,152 @@ def move_leg(robot, monitor, leg, settle, *, stream=None, stop_at_end=True) -> b
     x, y, th = odom_pose(monitor.odom)
 
     print(f"주행 종료: x={x:+.3f}, y={y:+.3f}, heading={math.degrees(th):+.1f} deg")
+
+    return not stream_failed
+
+
+def move_route(
+    robot,
+    monitor,
+    legs,
+    settle,
+    *,
+    blend_time=0.5,
+    stream=None,
+    stop_at_end=True,
+) -> bool:
+    """인접 leg의 5차 profile을 겹쳐 중간 정지 없이 하나의 trajectory로 추종한다."""
+    if not legs:
+        raise ValueError("연속 경로에는 leg가 하나 이상 필요합니다.")
+
+    if blend_time < 0.0:
+        raise ValueError("blend_time은 0 이상이어야 합니다.")
+
+    if len(legs) > 1 and blend_time >= min(leg.duration for leg in legs):
+        raise ValueError("blend_time은 가장 짧은 leg duration보다 작아야 합니다.")
+
+    for index in range(1, len(legs)):
+        previous = legs[index - 1]
+        current = legs[index]
+        previous_end = (previous.x1, previous.y1, previous.th0 + previous.dth)
+        current_start = (current.x0, current.y0, current.th0)
+
+        if any(abs(a - b) > 1e-6 for a, b in zip(previous_end, current_start)):
+            raise ValueError(f"leg {index}와 leg {index + 1}이 연결되어 있지 않습니다.")
+
+    segment_starts = [0.0]
+
+    for leg in legs[:-1]:
+        segment_starts.append(segment_starts[-1] + leg.duration - blend_time)
+
+    total_duration = segment_starts[-1] + legs[-1].duration
+    start_x = legs[0].x0
+    start_y = legs[0].y0
+    start_heading = legs[0].th0
+    final_x = legs[-1].x1
+    final_y = legs[-1].y1
+    final_heading = legs[-1].th0 + legs[-1].dth
+
+    displacements = [
+        (
+            leg.x1 - leg.x0,
+            leg.y1 - leg.y0,
+            leg.dth,
+        )
+        for leg in legs
+    ]
+
+    owns_stream = stream is None
+
+    if owns_stream:
+        stream = robot.create_command_stream(priority=10)
+
+    t0 = time.monotonic()
+    tick = 0
+    stream_failed = False
+
+    try:
+        while True:
+            elapsed_total = time.monotonic() - t0
+            x, y, heading = odom_pose(monitor.odom)
+
+            xd = start_x
+            yd = start_y
+            heading_desired = start_heading
+            vx_world = 0.0
+            vy_world = 0.0
+            w_ff = 0.0
+
+            # 각 leg의 profile을 blend_time만큼 겹쳐서 이전 감속 중 다음 동작이 함께 시작되도록 한다.
+            for leg, segment_start, displacement in zip(legs, segment_starts, displacements):
+                progress, progress_velocity = quintic((elapsed_total - segment_start) / leg.duration)
+                progress_velocity /= leg.duration
+                dx, dy, dheading = displacement
+
+                xd += dx * progress
+                yd += dy * progress
+                heading_desired += dheading * progress
+
+                vx_world += dx * progress_velocity
+                vy_world += dy * progress_velocity
+                w_ff += dheading * progress_velocity
+
+            ex_world = xd - x
+            ey_world = yd - y
+
+            c = math.cos(heading)
+            sn = math.sin(heading)
+
+            ex_body = c * ex_world + sn * ey_world
+            ey_body = -sn * ex_world + c * ey_world
+            heading_error = wrap_angle(heading_desired - heading)
+
+            pos_error = math.hypot(final_x - x, final_y - y)
+            final_heading_error = wrap_angle(final_heading - heading)
+
+            if elapsed_total >= total_duration:
+                arrived = pos_error <= POS_TOL and abs(final_heading_error) <= ANG_TOL
+
+                if arrived or elapsed_total >= total_duration + settle:
+                    break
+
+            vx = c * vx_world + sn * vy_world + KP_LIN * ex_body
+            vy = -sn * vx_world + c * vy_world + KP_LIN * ey_body
+            w = w_ff + KP_ANG * heading_error
+
+            vx = max(-MAX_LIN_VEL, min(MAX_LIN_VEL, vx))
+            vy = max(-MAX_LIN_VEL, min(MAX_LIN_VEL, vy))
+            w = max(-MAX_ANG_VEL, min(MAX_ANG_VEL, w))
+
+            feedback = stream.send_command(build_se2_command(vx, vy, w), SEND_TIMEOUT_MS)
+
+            if feedback.status == rby.RobotCommandFeedback.Status.Finished:
+                stream_failed = True
+                break
+
+            tick += 1
+            next_tick = t0 + tick * DT
+            sleep_time = next_tick - time.monotonic()
+
+            if sleep_time > 0.0:
+                time.sleep(sleep_time)
+
+        if not stream_failed and stop_at_end:
+            for _ in range(3):
+                stream.send_command(build_se2_command(0.0, 0.0, 0.0), SEND_TIMEOUT_MS)
+                time.sleep(DT)
+
+            time.sleep(0.3)
+
+    finally:
+        if owns_stream:
+            stream.cancel()
+            stream.wait_for(500)
+
+    x, y, heading = odom_pose(monitor.odom)
+    print(
+        f"연속 경로 종료: blend={blend_time:.2f} s, x={x:+.3f}, y={y:+.3f}, "
+        f"heading={math.degrees(heading):+.1f} deg"
+    )
 
     return not stream_failed
