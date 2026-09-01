@@ -1,14 +1,13 @@
-#!/usr/bin/env python3
 """RB-Y1 tote 인식/파지, 모바일 이송, AR 정렬, 배치 및 복귀 통합 데모.
 
 동작 순서
 0. torso / head를 calibration 기준 자세로 먼저 맞춘 뒤, main에서 Head RealSense pipeline을 한 번만 시작해 Tote/AR가 함께 사용
 1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
 2. Tote 정렬 후 양팔을 BEFORE → GRASP로 이동한 뒤 그리퍼를 닫고 UP 자세로 들어 올림
-3. BACK + TURN + STRAIGHT를 합성한 하나의 direct target으로 이송하며 후반에 Head를 정면으로 전환
+3. BACK + TURN + STRAIGHT를 합성한 direct target으로 이송하며 후반에 Head를 정면 자세로 전환
 4. AR 마커 기준으로 배치 위치 정렬
 5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE 자세로 후퇴
-6. 복귀는 선반을 피해 BACK을 단독 수행한 뒤, TURN + STRAIGHT를 합성한 direct target으로 이동
+6. 복귀는 BACK을 단독 수행한 뒤 TURN + STRAIGHT를 합성한 direct target으로 이동
 7. Head RealSense pipeline의 start / stop 소유권은 main에만 두고, Tote / AR aligner는 전달받은 공용 stream에서 frame만 읽음
 8. 로봇 상태는 기존 SDK callback에서 WCS publisher에도 전달하고, 작업 상태와 함께 별도 스레드에서 주기 전송
 
@@ -60,11 +59,21 @@ INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 BEFORE_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
 BEFORE_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
 
+
+# BEFORE_RIGHT = np.deg2rad([-50.821, -43.007, -16.543, -42.856, -31.054, 61.499, 0.017]).tolist()
+# BEFORE_LEFT = np.deg2rad([-50.821, 43.007, 16.543, -42.856, 31.054, 61.499, 0.017]).tolist()
+
+AFTER_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
+AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
+
 GRASP_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
 GRASP_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
 
 UP_RIGHT = np.deg2rad([-20.43, -25.28, -27.43, -98.12, -52.06, 91.75, -15.12]).tolist()
 UP_LEFT = np.deg2rad([-20.43, 25.28, 27.43, -98.12, 52.06, 91.75, 15.12]).tolist()
+
+BACK_RIGHT = np.deg2rad([-17.36, -31.32, -35.09, -99.56, -59.69, 98.00, -13.33]).tolist()
+BACK_LEFT = np.deg2rad([-17.36, 31.32, 35.09, -99.56, 59.69, 98.00, 13.33]).tolist()
 
 HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
 HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
@@ -100,15 +109,15 @@ TURN_TARGET = (-0.05, -0.05, math.radians(-180.43))
 STRAIGHT_TARGET = (0.65, 0.0, 0.0)
 
 OUTBOUND_DIRECT_TARGET = compose_relative_targets(BACK_TARGET, TURN_TARGET, STRAIGHT_TARGET)
-OUTBOUND_DIRECT_DURATION = 10
-OUTBOUND_HEAD_DELAY = 7.5
+OUTBOUND_DIRECT_DURATION = 12.5
+OUTBOUND_HEAD_DELAY = 9.0
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 RETURN_TURN_TARGET = (0.0, 0.0, math.radians(181.43))
-RETURN_STRAIGHT_TARGET = (0.88, 0.0, 0.0)
+RETURN_STRAIGHT_TARGET = (0.95, 0.0, 0.0)
 
 RETURN_TURN_AND_STRAIGHT_TARGET = compose_relative_targets(RETURN_TURN_TARGET, RETURN_STRAIGHT_TARGET)
-RETURN_TURN_AND_STRAIGHT_DURATION = 12.0
+RETURN_TURN_AND_STRAIGHT_DURATION = 15.0
 
 # ------------------------------------------------------------------
 ###############           각 액션 정의             #################
@@ -137,7 +146,7 @@ def run_mobile_leg(robot, monitor, stream, step: str, target, duration: float, s
 
 
 def move_head_async(robot, head_pose, description: str, delay: float = 0.0) -> Future:
-    """Head 명령을 선택적으로 지연한 뒤 별도 thread에서 실행해 모바일 주행과 겹친다."""
+    """Torso 기준을 유지하며 Head 명령을 선택적으로 지연해 주행과 겹친다."""
     future = Future()
 
     def worker():
@@ -216,7 +225,7 @@ def finish_pending_arm_move(future: Future | None, description: str) -> None:
 
 
 def run_turn_and_go(robot, monitor) -> bool:
-    """BACK + TURN + STRAIGHT를 합성한 direct target으로 이송하고 후반에 Head를 든다."""
+    """BACK + TURN + STRAIGHT direct target으로 이송하고 기존 직진 시점에 Head를 든다."""
     stream = robot.create_command_stream(priority=10)
     head_move = None
 
@@ -249,22 +258,20 @@ def run_turn_and_go(robot, monitor) -> bool:
 
 
 def run_return_route(robot, monitor) -> bool:
-    """BACK으로 선반에서 먼저 빠진 뒤 TURN + STRAIGHT direct target으로 복귀한다."""
+    """BACK을 단독 수행한 뒤 TURN + STRAIGHT direct target으로 복귀한다."""
     stream = robot.create_command_stream(priority=10)
     head_move = None
     arm_up_move = None
 
     try:
-        head_move = move_head_async(robot, HEAD_DOWN, "복귀 1/2과 동시에 다음 Tote 인식을 위해 Head 숙이기")
-
-        if not run_mobile_leg(robot, monitor, stream, "복귀 1/2: BACK", RETURN_BACK_TARGET, 3.0, True, 0.2):
+        if not run_mobile_leg(robot, monitor, stream, "복귀 1/2: BACK", RETURN_BACK_TARGET, 3.0, False, 0.0):
             return False
 
         arm_up_move = move_arms_async(
             robot,
-            UP_RIGHT,
-            UP_LEFT,
-            "복귀 2/2 TURN + STRAIGHT와 동시에 양팔을 UP 자세로 이동",
+            BACK_RIGHT,
+            BACK_LEFT,
+            "복귀 2/2과 동시에 양팔을 UP 자세로 이동",
         )
         route_ok = run_mobile_leg(
             robot,
@@ -276,6 +283,8 @@ def run_return_route(robot, monitor) -> bool:
             True,
             0.2,
         )
+
+        head_move = move_head_async(robot, HEAD_DOWN, "복귀 1/3과 동시에 다음 Tote 인식을 위해 Head 숙이기")
 
         head_ok = wait_for_head_move(head_move, "Head Tote 인식 자세 이동")
         head_move = None
@@ -299,12 +308,14 @@ def detect_grasp_and_lift(
     gripper_torque: float,
 ) -> bool:
     """Tote를 정렬한 뒤 양팔을 BEFORE → GRASP → UP 순서로 이동해 파지한다."""
-    print("[1/4] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
+
+
+    print("[2/4] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
     if not tote_aligner.align(robot, monitor, verify=True):
         print("Tote one-shot 정렬 실패")
         return False
 
-    print("[2/4] 현재 자세 → BEFORE")
+    print("[1/4] 현재 자세 → BEFORE")
     if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=2.0):
         print("BEFORE 자세 이동 실패")
         return False
@@ -337,7 +348,7 @@ def lower_release_and_retract(robot, gripper) -> bool:
     gripper.open(duration=1.0)
 
     print("GRASP → BEFORE")
-    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=2.0):
+    if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=2.0):
         print("BEFORE 자세 이동 실패")
         return False
 
