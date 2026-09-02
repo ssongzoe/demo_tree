@@ -32,6 +32,10 @@ WCS_HEALTH_PATH = os.getenv("WCS_HEALTH_PATH", "/health")
 WCS_STATUS_PATH = os.getenv("WCS_STATUS_PATH", "/api/v1/rb/rby1/status")
 HTTP_TIMEOUT_SEC = _positive_float("HTTP_TIMEOUT_SEC", 5.0)
 
+# 작업 명령 수신 (테스트용 가짜 WCS: tools/fake_wcs/server.py). {serial}은 URL-quote된 robotSerial로 치환된다.
+WCS_COMMAND_PATH = os.getenv("WCS_COMMAND_PATH", "/api/v1/rb/rby1/command/{serial}")
+COMMAND_POLL_HZ = _positive_float("COMMAND_POLL_HZ", 1.0)
+
 # 전송 대상과 heartbeat 주기
 ROBOT_SERIAL = os.getenv("ROBOT_SERIAL", "RBY1-001")
 UPLOAD_RATE_HZ = _positive_float("UPLOAD_RATE_HZ", 1.0)

@@ -22,6 +22,7 @@ class WcsClient:
         *,
         dry_run: bool = False,
         session: requests.Session | None = None,
+        command_path: str | None = None,
     ) -> None:
         if not base_url.strip():
             raise ValueError("WCS base_url이 비어 있습니다.")
@@ -34,6 +35,9 @@ class WcsClient:
         self._timeout = timeout
         self._dry_run = dry_run
         self._logged_first_ok = False
+        self._command_path = command_path
+        self._command_error_logged = False
+        self._dry_run_command_id = 0
         self._owns_session = session is None
         self._session = session or requests.Session()
         self._session.headers.update({"Content-Type": "application/json; charset=utf-8"})
@@ -93,9 +97,54 @@ class WcsClient:
 
         return True
 
+    def get_command(self, serial: str) -> dict[str, Any] | None:
+        """WCS 작업 명령 한 건을 조회한다. 실패하면 None (호출부가 다음 주기에 재시도).
+
+        응답 규격(테스트용): {"commandId": int, "command": "START"|"WAIT", "issuedAt": str}
+        DRY_RUN이면 서버 없이도 데모가 돌도록 매번 새 commandId의 START를 돌려준다.
+        """
+        if self._command_path is None:
+            return None
+
+        if self._dry_run:
+            self._dry_run_command_id += 1
+            log.info("[DRY_RUN] 명령 조회 생략 -> START (commandId=%d)", self._dry_run_command_id)
+            return {"commandId": self._dry_run_command_id, "command": "START", "issuedAt": None}
+
+        url = self._join_url(self._command_path.format(serial=quote(serial, safe="")))
+        try:
+            response = self._session.get(url, timeout=self._timeout)
+        except requests.RequestException as error:
+            self._log_command_error("WCS 명령 조회 실패: %s", error)
+            return None
+
+        if not 200 <= response.status_code < 300:
+            self._log_command_error("WCS 명령 조회 -> HTTP %s: %s",
+                                    response.status_code, response.text.strip()[:160])
+            return None
+
+        try:
+            body = response.json()
+        except ValueError:
+            self._log_command_error("WCS 명령 응답이 JSON이 아닙니다: %r", response.text.strip()[:160])
+            return None
+
+        if not isinstance(body, dict) or "command" not in body:
+            self._log_command_error("WCS 명령 응답 형식 오류: %r", body)
+            return None
+
+        self._command_error_logged = False
+        return body
+
     def close(self) -> None:
         if self._owns_session:
             self._session.close()
+
+    def _log_command_error(self, message: str, *args: Any) -> None:
+        # 1Hz 폴링이므로 같은 오류가 반복되면 첫 1회만 남긴다.
+        if not self._command_error_logged:
+            log.warning(message, *args)
+            self._command_error_logged = True
 
     def _status_url(self, serial: str) -> str:
         encoded_serial = quote(serial, safe="")

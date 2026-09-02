@@ -10,6 +10,7 @@
 6. 복귀는 BACK을 단독 수행한 뒤 TURN + STRAIGHT를 합성한 direct target으로 이동
 7. Head RealSense pipeline의 start / stop 소유권은 main에만 두고, Tote / AR aligner는 전달받은 공용 stream에서 frame만 읽음
 8. 로봇 상태는 기존 SDK callback에서 WCS publisher에도 전달하고, 작업 상태와 함께 별도 스레드에서 주기 전송
+9. 각 사이클은 WCS의 START 명령(GET command 폴링)을 받은 뒤 시작한다. --no-wcs-command 이면 기존처럼 연속 반복
 
 이동 거리와 회전각은 아래 target 상수만 수정하면 되며, 실행 로그는 target 값을 직접 읽어 출력하므로 값과 설명이 따로 어긋나지 않는다.
 """
@@ -431,6 +432,7 @@ def main() -> None:
     parser.add_argument("--gripper-target", type=float, default=DEFAULT_GRIPPER_TARGET, help="그리퍼 닫힘 위치")
     parser.add_argument("--gripper-torque", type=float, default=DEFAULT_GRIPPER_TORQUE, help="그리퍼 파지 토크 [Nm]")
     parser.add_argument("--cycles", type=int, default=0, help="반복 횟수, 0이면 Ctrl+C 전까지 무한 반복")
+    parser.add_argument("--no-wcs-command", action="store_true", help="WCS START 명령을 기다리지 않고 연속 반복")
     args = parser.parse_args()
 
     robot = initialize_mobile(args.address, args.model, power=".*", servo=".*", unlimited=False)
@@ -486,6 +488,13 @@ def main() -> None:
         cycle_index = 1
 
         while args.cycles == 0 or cycle_index <= args.cycles:
+            if not args.no_wcs_command:
+                # 사이클 사이에는 IDLE로 두고, WCS가 새 commandId의 START를 내릴 때까지 기다린다.
+                wcs_publisher.set_work_state("IDLE")
+                print("WCS 작업 명령 대기 중...")
+                command = wcs_publisher.wait_for_command("START")
+                print(f"WCS 명령 수신: commandId={command['commandId']}")
+
             wcs_publisher.set_work_state("WORKING")
             run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_index)
             wcs_publisher.set_work_state("DONE")

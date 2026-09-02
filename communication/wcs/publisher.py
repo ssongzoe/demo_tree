@@ -41,7 +41,10 @@ class WcsPublisher:
             config.WCS_STATUS_PATH,
             config.HTTP_TIMEOUT_SEC,
             dry_run=dry_run,
+            command_path=config.WCS_COMMAND_PATH,
         )
+        self._command_poll_period = 1.0 / config.COMMAND_POLL_HZ
+        self._last_command_id = 0
 
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -124,6 +127,41 @@ class WcsPublisher:
                 self._work_events.append(work_event)
 
         self._wake_event.set()
+
+    def wait_for_command(
+        self,
+        command: str = "START",
+        *,
+        timeout: float | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, Any] | None:
+        """호출 스레드에서 WCS 명령을 폴링해 새 commandId의 `command`가 오면 그 명령을 돌려준다.
+
+        전송 스레드와는 독립이다. timeout 초과 또는 stop_event가 set되면 None.
+        같은 commandId는 한 번만 소비하므로 이미 처리한 START를 다시 받지 않는다.
+        """
+        wanted = command.strip().upper()
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return None
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+
+            body = self._client.get_command(self._serial)
+            if body is not None:
+                command_id = _int_or_none(body.get("commandId"))
+                received = str(body.get("command", "")).strip().upper()
+                if received == wanted and command_id is not None and command_id > self._last_command_id:
+                    self._last_command_id = command_id
+                    log.info("WCS 명령 수신: %s (commandId=%d)", received, command_id)
+                    return body
+
+            if stop_event is not None:
+                stop_event.wait(self._command_poll_period)
+            else:
+                time.sleep(self._command_poll_period)
 
     def _run(self) -> None:
         next_upload = time.monotonic()
@@ -215,3 +253,10 @@ class WcsPublisher:
         if not self._waiting_logged:
             log.info("첫 RobotState를 기다리는 중입니다.")
             self._waiting_logged = True
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
