@@ -65,6 +65,8 @@ AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.03
 DOWN_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
 DOWN_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
 
+STRETCH_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
+STRETCH_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
 
 GRASP_RIGHT = np.deg2rad([-37.43, -32.30, -21.34, -49.22, -63.95, 81.79, 2.40]).tolist()
 GRASP_LEFT = np.deg2rad([-37.43, 32.30, 21.34, -49.22, 63.95, 81.79, -2.40]).tolist()
@@ -114,7 +116,7 @@ OUTBOUND_HEAD_DELAY = 3.0
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 RETURN_TURN_TARGET = (0.0, 0.0, math.radians(183.43))
-RETURN_STRAIGHT_TARGET = (0.95, 0.0, 0.0)
+RETURN_STRAIGHT_TARGET = (1.00, 0.0, 0.0)
 
 RETURN_TURN_AND_STRAIGHT_TARGET = compose_relative_targets(RETURN_TURN_TARGET, RETURN_STRAIGHT_TARGET)
 RETURN_TURN_AND_STRAIGHT_DURATION = 9.0
@@ -321,7 +323,7 @@ def detect_grasp_and_lift(
         return False
 
     print("[3/4] BEFORE → GRASP")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.2):
+    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.5):
         print("GRASP 자세 이동 실패")
         return False
 
@@ -339,7 +341,12 @@ def detect_grasp_and_lift(
 
 def lower_release_and_retract(robot, gripper) -> bool:
     """AR 정렬 후 UP에서 DOWN로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 AFTER 자세로 양팔을 후퇴한다."""
-    print("[5/6] UP → DOWN")
+    print("[1/6] UP → stretch")
+    if not move_both_arms(robot, STRETCH_RIGHT, STRETCH_LEFT, minimum_time=1.0):
+        print("STRETCH 자세 이동 실패")
+        return False
+
+    print("[1/6] stretch -> Down ")
     if not move_both_arms(robot, DOWN_RIGHT, DOWN_LEFT, minimum_time=1.0):
         print("DOWN 자세 이동 실패")
         return False

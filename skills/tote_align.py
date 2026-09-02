@@ -28,8 +28,8 @@ from utils.tote_vision import LeftMeasurement, flush_camera, measure_left_featur
 
 
 # 새 grasp 성공 자세의 Robust detector median
-TARGET_TL_X_PX = 83.363
-TARGET_TL_Y_PX = 144.913
+TARGET_TL_X_PX = 80.363
+TARGET_TL_Y_PX = 152.913
 TARGET_ANGLE_DEG = -1.190
 
 # 자동 calibration 결과
@@ -50,8 +50,8 @@ J_LEFT_INV = np.linalg.inv(J_LEFT)
 POSITION_TOL_M = 0.02
 IMAGE_ANGLE_TOL_DEG = 1.5
 
-FORWARD_TOL_M = 0.005
-LATERAL_TOL_M = 0.02
+FORWARD_TOL_M = 0.015
+LATERAL_TOL_M = 0.04
 
 # 한 번에 움직일 soft limit과 오검출을 차단할 hard limit을 분리한다.
 MAX_CORRECTIONS = 3
