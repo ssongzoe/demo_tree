@@ -29,7 +29,7 @@ from utils.tote_vision import LeftMeasurement, flush_camera, measure_left_featur
 
 # 새 grasp 성공 자세의 Robust detector median
 TARGET_TL_X_PX = 83.363
-TARGET_TL_Y_PX = 145.913
+TARGET_TL_Y_PX = 144.913
 TARGET_ANGLE_DEG = -1.190
 
 # 자동 calibration 결과
@@ -49,6 +49,9 @@ J_LEFT_INV = np.linalg.inv(J_LEFT)
 # 최종 grasp 허용 범위
 POSITION_TOL_M = 0.02
 IMAGE_ANGLE_TOL_DEG = 1.5
+
+FORWARD_TOL_M = 0.005
+LATERAL_TOL_M = 0.02
 
 # 한 번에 움직일 soft limit과 오검출을 차단할 hard limit을 분리한다.
 MAX_CORRECTIONS = 3
@@ -117,7 +120,10 @@ def pose_error_to_command(error: PoseError) -> RelativeCommand:
 
 def within_tolerance(measurement: LeftMeasurement, error: PoseError) -> bool:
     """현재 자세가 실제 grasp 성공 허용 범위 안인지 판정한다."""
-    position_ok = abs(error.x_m) <= POSITION_TOL_M and abs(error.y_m) <= POSITION_TOL_M
+    position_ok = (
+        abs(error.x_m) <= FORWARD_TOL_M
+        and abs(error.y_m) <= LATERAL_TOL_M
+    )
     angle_ok = abs(measurement.angle_deg - TARGET_ANGLE_DEG) <= IMAGE_ANGLE_TOL_DEG
 
     return position_ok and angle_ok
