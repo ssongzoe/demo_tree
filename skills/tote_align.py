@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TOP rim + LEFT top corner(TL)로 tote grasp 자세에 one-shot 정렬한다.
+"""TOP rim + LEFT top corner(TL)로 tote grasp 자세에 제한된 반복 보정으로 정렬한다.
 
 입력 feature
 - TL.x [px]
@@ -11,7 +11,8 @@
 - y [m]
 - yaw [deg]
 
-성공한 자동 X/Y/Yaw calibration의 local Jacobian을 사용하고 x/y/yaw를 한 SE(2) trajectory로 동시에 이동한다.
+성공한 자동 X/Y/Yaw calibration의 local Jacobian을 사용한다.
+한 번의 명령이 크면 안전한 step으로 제한하고, 이동 후 재측정하며 최대 3회 보정한다.
 """
 
 from __future__ import annotations
@@ -47,11 +48,15 @@ J_LEFT_INV = np.linalg.inv(J_LEFT)
 
 # 최종 grasp 허용 범위
 POSITION_TOL_M = 0.02
-IMAGE_ANGLE_TOL_DEG = 1.0
+IMAGE_ANGLE_TOL_DEG = 1.5
 
-# 정상 동작을 막지 않고 오검출로 인한 비정상 대명령만 차단한다.
-MAX_TRANSLATION_COMMAND_M = 0.10
-MAX_YAW_COMMAND_DEG = 10.0
+# 한 번에 움직일 soft limit과 오검출을 차단할 hard limit을 분리한다.
+MAX_CORRECTIONS = 3
+MEASURE_ATTEMPTS = 2
+MAX_TRANSLATION_STEP_M = 0.07
+MAX_YAW_STEP_DEG = 7.0
+HARD_MAX_TRANSLATION_M = 0.18
+HARD_MAX_YAW_DEG = 20.0
 
 # 모바일 trajectory
 SETTLE_S = 0.7
@@ -119,10 +124,30 @@ def within_tolerance(measurement: LeftMeasurement, error: PoseError) -> bool:
 
 
 def command_is_reasonable(command: RelativeCommand) -> bool:
-    """오검출로 인한 비정상적으로 큰 명령만 차단한다."""
+    """오검출 가능성이 높은 hard limit 초과 명령만 차단한다."""
     translation_m = math.hypot(command.x_m, command.y_m)
 
-    return translation_m <= MAX_TRANSLATION_COMMAND_M and abs(command.yaw_deg) <= MAX_YAW_COMMAND_DEG
+    return translation_m <= HARD_MAX_TRANSLATION_M and abs(command.yaw_deg) <= HARD_MAX_YAW_DEG
+
+
+def limit_command_step(command: RelativeCommand) -> tuple[RelativeCommand, float]:
+    """x/y/yaw 비율을 유지하면서 한 번의 보정 명령을 soft limit 안으로 줄인다."""
+    translation_m = math.hypot(command.x_m, command.y_m)
+    scale = 1.0
+
+    if translation_m > MAX_TRANSLATION_STEP_M:
+        scale = min(scale, MAX_TRANSLATION_STEP_M / translation_m)
+
+    if abs(command.yaw_deg) > MAX_YAW_STEP_DEG:
+        scale = min(scale, MAX_YAW_STEP_DEG / abs(command.yaw_deg))
+
+    limited = RelativeCommand(
+        x_m=command.x_m * scale,
+        y_m=command.y_m * scale,
+        yaw_deg=command.yaw_deg * scale,
+    )
+
+    return limited, scale
 
 
 def trajectory_duration(command: RelativeCommand) -> float:
@@ -159,7 +184,7 @@ def print_measurement(label: str, measurement: LeftMeasurement, error: PoseError
 
 
 class ToteAligner:
-    """자체 pipeline 또는 main에서 주입한 공용 카메라 pipeline으로 tote를 one-shot 정렬한다."""
+    """자체 pipeline 또는 main의 공용 pipeline으로 tote를 측정하고 최대 3회 보정한다."""
 
     def __init__(self, camera_serial: str | None = None, show: bool = False, *, camera=None):
         if camera is None and not camera_serial:
@@ -188,7 +213,10 @@ class ToteAligner:
             return
 
         if self._camera is not None:
-            raise RuntimeError("공용 camera pipeline이 시작되지 않았습니다. main()에서 먼저 camera.start() 하세요.")
+            raise RuntimeError(
+                "공용 camera pipeline이 시작되지 않았습니다. "
+                "main()에서 먼저 camera.start() 하세요."
+            )
 
         self._pipeline = start_camera(self.camera_serial)
 
@@ -204,71 +232,91 @@ class ToteAligner:
             except cv2.error:
                 pass
 
+    def _measure_with_retry(self, label: str) -> LeftMeasurement | None:
+        """현재 자세의 fresh frame을 사용하며, 검출 실패 시 움직이지 않고 다시 측정한다."""
+        for attempt in range(1, MEASURE_ATTEMPTS + 1):
+            flush_camera(self.pipeline)
+            measurement = measure_left_feature(
+                self.pipeline,
+                frame_count=MEASURE_FRAMES,
+                timeout_s=MEASURE_TIMEOUT_S,
+                show=self.show,
+                label=label,
+            )
+
+            if measurement is not None:
+                return measurement
+
+            if attempt < MEASURE_ATTEMPTS:
+                print(f"{label} TOP + TL 측정 실패: 카메라 재측정 {attempt + 1}/{MEASURE_ATTEMPTS}")
+
+        return None
+
     def align(self, robot, monitor: OdometryMonitor, *, verify: bool = True) -> bool:
-        """현재 시점의 fresh TOP + TL feature를 측정해 x/y/yaw를 one-shot으로 보정하고 필요하면 최종 자세를 검증한다."""
+        """fresh TOP + TL을 반복 측정하며 x/y/yaw를 최대 3회 제한 보정한다."""
         if not self.started:
             self.start()
 
-        # 이동 중 쌓인 frame은 버리고 현재 자세의 fresh frame만 사용한다.
-        flush_camera(self.pipeline)
+        for correction_count in range(MAX_CORRECTIONS + 1):
+            label = "BEFORE" if correction_count == 0 else f"AFTER {correction_count}"
+            measurement = self._measure_with_retry(label)
 
-        before = measure_left_feature(
-            self.pipeline,
-            frame_count=MEASURE_FRAMES,
-            timeout_s=MEASURE_TIMEOUT_S,
-            show=self.show,
-            label="BEFORE",
-        )
+            if measurement is None:
+                print(f"Tote 정렬 실패: {label} TOP + TL을 안정적으로 측정하지 못했습니다.")
+                return False
 
-        if before is None:
-            print("Tote 정렬 실패: TOP + TL을 안정적으로 측정하지 못했습니다.")
-            return False
+            error = estimate_pose_error(measurement)
+            print_measurement(label, measurement, error)
 
-        before_error = estimate_pose_error(before)
-        print_measurement("BEFORE", before, before_error)
+            if within_tolerance(measurement, error):
+                if correction_count == 0:
+                    print("이미 tote grasp 정렬 범위 안입니다.")
+                else:
+                    print(f"Tote 정렬 성공: {correction_count}회 보정")
+                return True
 
-        if within_tolerance(before, before_error):
-            print("이미 tote grasp 정렬 범위 안입니다.")
-            return True
+            if correction_count >= MAX_CORRECTIONS:
+                print(
+                    f"Tote 정렬 실패: {MAX_CORRECTIONS}회 보정 후에도 "
+                    "grasp 허용 범위를 벗어났습니다."
+                )
+                return False
 
-        command = pose_error_to_command(before_error)
+            raw_command = pose_error_to_command(error)
+            distance_m = math.hypot(raw_command.x_m, raw_command.y_m)
 
-        print()
-        print(f"One-shot command: x={command.x_m:+.4f} m | y={command.y_m:+.4f} m | yaw={command.yaw_deg:+.3f} deg")
+            print()
+            print(
+                f"Raw command: x={raw_command.x_m:+.4f} m | y={raw_command.y_m:+.4f} m | "
+                f"yaw={raw_command.yaw_deg:+.3f} deg"
+            )
 
-        if not command_is_reasonable(command):
-            print("Tote 정렬 실패: 비정상적으로 큰 one-shot command입니다.")
-            return False
+            if not command_is_reasonable(raw_command):
+                print(
+                    "Tote 정렬 실패: hard limit을 넘는 명령입니다. "
+                    f"translation={distance_m:.3f} m, yaw={raw_command.yaw_deg:+.2f} deg"
+                )
+                return False
 
-        if not move_one_shot(robot, monitor, command):
-            print("Tote 정렬 실패: 모바일 이동 실패")
-            return False
+            command, scale = limit_command_step(raw_command)
+            correction_number = correction_count + 1
 
-        if not verify:
-            return True
+            if scale < 1.0:
+                print(
+                    f"보정 {correction_number}/{MAX_CORRECTIONS}: soft limit 적용 -> "
+                    f"x={command.x_m:+.4f} m | y={command.y_m:+.4f} m | yaw={command.yaw_deg:+.3f} deg"
+                )
+            else:
+                print(f"보정 {correction_number}/{MAX_CORRECTIONS}: 명령을 그대로 실행합니다.")
 
-        flush_camera(self.pipeline)
+            if not move_one_shot(robot, monitor, command):
+                print(f"Tote 정렬 실패: 모바일 보정 {correction_number}/{MAX_CORRECTIONS} 이동 실패")
+                return False
 
-        after = measure_left_feature(
-            self.pipeline,
-            frame_count=MEASURE_FRAMES,
-            timeout_s=MEASURE_TIMEOUT_S,
-            show=self.show,
-            label="AFTER",
-        )
+            if not verify:
+                print("Tote one-shot 정렬 완료: verify=False")
+                return True
 
-        if after is None:
-            print("Tote 정렬 실패: 이동 후 TOP + TL 측정 실패")
-            return False
-
-        after_error = estimate_pose_error(after)
-        print_measurement("AFTER", after, after_error)
-
-        if within_tolerance(after, after_error):
-            print("Tote one-shot 정렬 성공")
-            return True
-
-        print("Tote one-shot 정렬 실패: 최종 오차가 grasp 허용 범위를 벗어났습니다.")
         return False
 
 
@@ -280,7 +328,7 @@ def align_tote(
     verify: bool = True,
     show: bool = False,
 ) -> bool:
-    """기존 단독 demo와의 호환용 함수이며, 한 번 호출할 때 D435 start → align → stop을 내부에서 수행한다."""
+    """기존 단독 demo 호환용이며 D435 start → align → stop을 내부 수행한다."""
     aligner = ToteAligner(camera_serial=camera_serial, show=show)
 
     try:

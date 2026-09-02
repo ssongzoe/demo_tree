@@ -59,8 +59,12 @@ INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 BEFORE_RIGHT = np.deg2rad([-38.23, -53.19, -21.31, -48.14, -63.73, 81.18, 2.39]).tolist()
 BEFORE_LEFT = np.deg2rad([-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]).tolist()
 
-AFTER_RIGHT = np.deg2rad([-38.23, -53.19, -21.31, -48.14, -63.73, 81.18, 2.39]).tolist()
-AFTER_LEFT = np.deg2rad([-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]).tolist()
+AFTER_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
+AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
+
+DOWN_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
+DOWN_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
+
 
 GRASP_RIGHT = np.deg2rad([-37.43, -32.30, -21.34, -49.22, -63.95, 81.79, 2.40]).tolist()
 GRASP_LEFT = np.deg2rad([-37.43, 32.30, 21.34, -49.22, 63.95, 81.79, -2.40]).tolist()
@@ -317,7 +321,7 @@ def detect_grasp_and_lift(
         return False
 
     print("[3/4] BEFORE → GRASP")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=0.8):
+    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.2):
         print("GRASP 자세 이동 실패")
         return False
 
@@ -334,18 +338,18 @@ def detect_grasp_and_lift(
 
 
 def lower_release_and_retract(robot, gripper) -> bool:
-    """AR 정렬 후 UP에서 GRASP로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 BEFORE 자세로 양팔을 후퇴한다."""
-    print("[5/6] UP → GRASP")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
-        print("GRASP 자세 이동 실패")
+    """AR 정렬 후 UP에서 DOWN로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 AFTER 자세로 양팔을 후퇴한다."""
+    print("[5/6] UP → DOWN")
+    if not move_both_arms(robot, DOWN_RIGHT, DOWN_LEFT, minimum_time=1.0):
+        print("DOWN 자세 이동 실패")
         return False
 
     print("그리퍼 열기")
     gripper.open(duration=1.0)
 
-    print("GRASP → BEFORE")
+    print("DOWN → AFTER")
     if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=1.0):
-        print("BEFORE 자세 이동 실패")
+        print("AFTER 자세 이동 실패")
         return False
 
     return True
