@@ -56,17 +56,9 @@ INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 # torso는 BEFORE / GRASP / UP 동안 동일하게 유지하며, 아래 값 하나만 사용한다.
 # -----------------------------------------------------------------------------
 
+
 BEFORE_RIGHT = np.deg2rad([-38.23, -53.19, -21.31, -48.14, -63.73, 81.18, 2.39]).tolist()
 BEFORE_LEFT = np.deg2rad([-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]).tolist()
-
-AFTER_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
-AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
-
-DOWN_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
-DOWN_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
-
-STRETCH_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
-STRETCH_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
 
 GRASP_RIGHT = np.deg2rad([-37.43, -32.30, -21.34, -49.22, -63.95, 81.79, 2.40]).tolist()
 GRASP_LEFT = np.deg2rad([-37.43, 32.30, 21.34, -49.22, 63.95, 81.79, -2.40]).tolist()
@@ -74,14 +66,23 @@ GRASP_LEFT = np.deg2rad([-37.43, 32.30, 21.34, -49.22, 63.95, 81.79, -2.40]).tol
 UP_RIGHT = np.deg2rad([-4.50, -28.21, -33.62, -106.81, -74.26, 99.28, -19.51]).tolist()
 UP_LEFT = np.deg2rad([-4.50, 28.21, 33.62, -106.81, 74.26, 99.28, 19.52]).tolist()
 
+DOWN_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
+DOWN_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
+
+STRETCH_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
+STRETCH_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
+
+AFTER_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
+AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
+
 BACK_RIGHT = np.deg2rad([-17.36, -31.32, -35.09, -99.56, -59.69, 98.00, -13.33]).tolist()
 BACK_LEFT = np.deg2rad([-17.36, 31.32, 35.09, -99.56, 59.69, 98.00, 13.33]).tolist()
 
 HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
 HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
+
 HEAD_MOVE_TIME = 2.0
 ARM_UP_MOVE_TIME = 2.0
-
 
 
 # -----------------------------------------------------------------------------
@@ -90,7 +91,15 @@ ARM_UP_MOVE_TIME = 2.0
 # 아래 target 값만 수정하면 실제 실행 로그도 현재 값에 맞춰 자동으로 바뀐다.
 # -----------------------------------------------------------------------------
 
+BACK_TARGET = (-0.10, 0.0, 0.0)
+TURN_TARGET = (-0.05, -0.05, math.radians(-180.43))
+STRAIGHT_TARGET = (0.65, 0.0, 0.0)
 
+RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
+RETURN_TURN_TARGET = (0.0, 0.0, math.radians(183.43))
+RETURN_STRAIGHT_TARGET = (1.00, 0.0, 0.0)
+
+# Beautiful Spiral Turn 만들기 
 def compose_relative_targets(*targets):
     """여러 body-frame 상대 target을 하나의 최종 상대 target으로 합성한다."""
     x_m = 0.0
@@ -106,23 +115,15 @@ def compose_relative_targets(*targets):
 
     return x_m, y_m, yaw_rad
 
-BACK_TARGET = (-0.10, 0.0, 0.0)
-TURN_TARGET = (-0.05, -0.05, math.radians(-180.43))
-STRAIGHT_TARGET = (0.65, 0.0, 0.0)
-
 OUTBOUND_DIRECT_TARGET = compose_relative_targets(BACK_TARGET, TURN_TARGET, STRAIGHT_TARGET)
-OUTBOUND_DIRECT_DURATION = 8.0
+OUTBOUND_DIRECT_DURATION = 8.0 # 가는거 8초
 OUTBOUND_HEAD_DELAY = 3.0
 
-RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
-RETURN_TURN_TARGET = (0.0, 0.0, math.radians(183.43))
-RETURN_STRAIGHT_TARGET = (1.00, 0.0, 0.0)
-
 RETURN_TURN_AND_STRAIGHT_TARGET = compose_relative_targets(RETURN_TURN_TARGET, RETURN_STRAIGHT_TARGET)
-RETURN_TURN_AND_STRAIGHT_DURATION = 9.0
+RETURN_TURN_AND_STRAIGHT_DURATION = 9.0 #오는거 9초
 
 # ------------------------------------------------------------------
-###############           각 액션 정의             #################
+#   ##############           Helper 함수들         #################
 # ------------------------------------------------------------------
 
 
@@ -192,7 +193,9 @@ def finish_pending_head_move(future: Future | None, description: str) -> None:
 
 
 def move_arms_async(robot, right_arm, left_arm, description: str) -> Future:
-    """양팔 명령을 별도 thread에서 실행해 모바일 회전과 겹친다."""
+    """
+    별도 thread에서 양팔 명령 실행
+    """
     future = Future()
 
     def worker():
@@ -226,6 +229,51 @@ def finish_pending_arm_move(future: Future | None, description: str) -> None:
         wait_for_arm_move(future, description)
 
 
+
+# ------------------------------------------------------------------
+#  ##############          구간 별 Action 정의        #################
+# ------------------------------------------------------------------
+
+#1. 잡는다 
+def detect_grasp_and_lift(
+    robot,
+    monitor,
+    gripper,
+    tote_aligner: ToteAligner,
+    gripper_target: float,
+    gripper_torque: float,
+) -> bool:
+    """Tote를 정렬한 뒤 양팔을 BEFORE → GRASP → UP 순서로 이동해 파지한다."""
+
+
+    print("[2/4] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
+    if not tote_aligner.align(robot, monitor, verify=True):
+        print("Tote one-shot 정렬 실패")
+        return False
+
+    print("[1/4] 현재 자세 → BEFORE")
+    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.0):
+        print("BEFORE 자세 이동 실패")
+        return False
+
+    print("[3/4] BEFORE → GRASP")
+    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.5):
+        print("GRASP 자세 이동 실패")
+        return False
+
+    print(f"그리퍼 닫기: target={gripper_target:.2f}, torque={gripper_torque:.2f} Nm")
+    gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
+    print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
+
+    print("[4/4] GRASP → UP")
+    if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.2):
+        print("UP 자세 이동 실패")
+        return False
+
+    return True
+
+
+#2. 간다.
 def run_turn_and_go(robot, monitor) -> bool:
     """BACK + TURN + STRAIGHT direct target으로 이송하고 기존 직진 시점에 Head를 든다."""
     stream = robot.create_command_stream(priority=10)
@@ -258,7 +306,31 @@ def run_turn_and_go(robot, monitor) -> bool:
         stream.cancel()
         stream.wait_for(500)
 
+# 3.놓는다
+def lower_release_and_retract(robot, gripper) -> bool:
+    """AR 정렬 후 UP에서 DOWN로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 AFTER 자세로 양팔을 후퇴한다."""
+    print("[1/6] UP → stretch")
+    if not move_both_arms(robot, STRETCH_RIGHT, STRETCH_LEFT, minimum_time=1.0):
+        print("STRETCH 자세 이동 실패")
+        return False
 
+    print("[1/6] stretch -> Down ")
+    if not move_both_arms(robot, DOWN_RIGHT, DOWN_LEFT, minimum_time=1.0):
+        print("DOWN 자세 이동 실패")
+        return False
+
+    print("그리퍼 열기")
+    gripper.open(duration=1.0)
+
+    print("DOWN → AFTER")
+    if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=1.0):
+        print("AFTER 자세 이동 실패")
+        return False
+
+    return True
+
+
+# 4.돌아온다
 def run_return_route(robot, monitor) -> bool:
     """BACK을 단독 수행한 뒤 TURN + STRAIGHT direct target으로 복귀한다."""
     stream = robot.create_command_stream(priority=10)
@@ -301,70 +373,9 @@ def run_return_route(robot, monitor) -> bool:
         stream.wait_for(500)
 
 
-def detect_grasp_and_lift(
-    robot,
-    monitor,
-    gripper,
-    tote_aligner: ToteAligner,
-    gripper_target: float,
-    gripper_torque: float,
-) -> bool:
-    """Tote를 정렬한 뒤 양팔을 BEFORE → GRASP → UP 순서로 이동해 파지한다."""
-
-
-    print("[2/4] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
-    if not tote_aligner.align(robot, monitor, verify=True):
-        print("Tote one-shot 정렬 실패")
-        return False
-
-    print("[1/4] 현재 자세 → BEFORE")
-    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.0):
-        print("BEFORE 자세 이동 실패")
-        return False
-
-    print("[3/4] BEFORE → GRASP")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.5):
-        print("GRASP 자세 이동 실패")
-        return False
-
-    print(f"그리퍼 닫기: target={gripper_target:.2f}, torque={gripper_torque:.2f} Nm")
-    gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
-    print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
-
-    print("[4/4] GRASP → UP")
-    if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.2):
-        print("UP 자세 이동 실패")
-        return False
-
-    return True
-
-
-def lower_release_and_retract(robot, gripper) -> bool:
-    """AR 정렬 후 UP에서 DOWN로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 AFTER 자세로 양팔을 후퇴한다."""
-    print("[1/6] UP → stretch")
-    if not move_both_arms(robot, STRETCH_RIGHT, STRETCH_LEFT, minimum_time=1.0):
-        print("STRETCH 자세 이동 실패")
-        return False
-
-    print("[1/6] stretch -> Down ")
-    if not move_both_arms(robot, DOWN_RIGHT, DOWN_LEFT, minimum_time=1.0):
-        print("DOWN 자세 이동 실패")
-        return False
-
-    print("그리퍼 열기")
-    gripper.open(duration=1.0)
-
-    print("DOWN → AFTER")
-    if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=1.0):
-        print("AFTER 자세 이동 실패")
-        return False
-
-    return True
-
-
 
 # -------------------------------------------------------------------
-###############           반복 시퀀스 정의            #################
+#  ##############           반복 시퀀스 정의            ###############
 # -------------------------------------------------------------------
 
 
@@ -404,18 +415,18 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
     print(f"{'=' * 24} CYCLE {cycle_index} DONE {'=' * 25}")
     time.sleep(1.0)  # 다음 사이클 시작 전 잠시 대기
 
+
+# ------------------------------------------------------------------
+#    ##############            Main           #################
+# ------------------------------------------------------------------
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="RB-Y1 tote vision full sequence 반복 데모")
     parser.add_argument("--address", default=ADDRESS, help="로봇 주소")
     parser.add_argument("--model", choices=("a", "m"), default="m", help="RB-Y1 모델")
     parser.add_argument("--marker-id", type=int, default=MARKER_ID, help="배치 위치 정렬에 사용할 AR 마커 ID")
-    parser.add_argument(
-        "--camera-serial",
-        "--tote-camera-serial",
-        dest="camera_serial",
-        default=HEAD_CAMERA_SERIAL,
-        help="Tote/AR 인식에 공용으로 사용할 Head RealSense serial",
-    )
+    parser.add_argument("--camera-serial",dest="camera_serial",default=HEAD_CAMERA_SERIAL,help="Tote/AR 인식에 공용으로 사용할 Head RealSense serial",)
     parser.add_argument("--show-tote", action="store_true", help="Tote 검출 OpenCV 화면 표시")
     parser.add_argument("--gripper-target", type=float, default=DEFAULT_GRIPPER_TARGET, help="그리퍼 닫힘 위치")
     parser.add_argument("--gripper-torque", type=float, default=DEFAULT_GRIPPER_TORQUE, help="그리퍼 파지 토크 [Nm]")
