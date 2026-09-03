@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "RBY1_transport_event_schema.json",
+  "title": "RB-Y1 반송 결과 보고 (RB-Y1 → WCS)",
+  "description": "RB-Y1이 반송 오더의 완료/실패를 SFA WCS에 보고하는 요청 body. SFA-WCS 규격서 v07.2 '10. 도착·완료·실패 보고'를 RB-Y1에 맞게 축소한 것입니다. 전송: POST http://210.101.65.119:5224/api/v1/rb/transport-events, Content-Type: application/json; charset=utf-8.",
+  "type": "object",
+  "required": ["eventId", "wcsOrderId", "eventType", "robotSerial", "occurredAt"],
+  "additionalProperties": true,
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "이벤트 고유 ID(UUID). WCS는 이 값을 기준으로 중복 수신을 멱등 처리해 주시기 바랍니다. RB-Y1은 전송 실패 시 동일한 eventId 를 유지한 채 재시도합니다.",
+      "examples": ["52860a3b3f6e498b951d97199253c0b5"]
+    },
+    "wcsOrderId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "보고 대상 오더의 wcsOrderId. WCS가 발행한 값을 그대로 돌려드립니다.",
+      "examples": ["WCS-20260903-000001"]
+    },
+    "eventType": {
+      "type": "string",
+      "enum": ["COMPLETED", "FAILED"],
+      "description": "RB-Y1은 최종 결과 2종만 보고합니다. 규격서 10.2의 중간 이벤트(ARRIVED_AT_FROM, LOAD_STARTED 등)는 RB-Y1 작업 특성상 사용하지 않으며, 진행 상황은 상태 업로드의 work_cycle 로 확인하실 수 있습니다.",
+      "examples": ["COMPLETED"]
+    },
+    "robotSerial": {
+      "type": "string",
+      "description": "보고 주체 로봇 시리얼. 상태 업로드의 robotSerial 과 동일한 값입니다.",
+      "examples": ["RBY1-001"]
+    },
+    "result": {
+      "type": "string",
+      "enum": ["SUCCESS", "FAILED"],
+      "description": "eventType 과 대응합니다. COMPLETED → SUCCESS, FAILED → FAILED.",
+      "examples": ["SUCCESS"]
+    },
+    "message": {
+      "type": ["string", "null"],
+      "maxLength": 200,
+      "description": "실패 사유. WCS UI 표시용이며 200자로 잘라서 보냅니다. 성공 시에는 null 입니다. 같은 내용이 상태 업로드의 robot_state.error_message 로도 전송됩니다.",
+      "examples": [null, "Tote 인식 / 정렬 / 파지 실패"]
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "이벤트 발생 시각. ISO 8601 UTC. 재시도하더라도 최초 발생 시각을 유지합니다.",
+      "examples": ["2026-09-03T05:02:11.000Z"]
+    }
+  },
+  "definitions": {
+    "callbackResponse": {
+      "type": "object",
+      "title": "WCS 응답 (HTTP 200)",
+      "description": "HTTP 2xx 는 수신 완료를 의미하며 업무 처리 완료와는 분리합니다(규격서 10.3).",
+      "required": ["accepted"],
+      "properties": {
+        "accepted": { "type": "boolean", "examples": [true] },
+        "eventId": { "type": "string", "examples": ["52860a3b3f6e498b951d97199253c0b5"] },
+        "receivedAt": { "type": "string", "format": "date-time", "examples": ["2026-09-03T05:02:11.050Z"] }
+      }
+    }
+  },
+  "x-behavior": {
+    "delivery": "at-least-once. 네트워크 오류 또는 5xx 응답이면 RB-Y1이 동일한 eventId 로 1초 간격으로 재시도하므로, 같은 이벤트를 두 번 이상 수신하실 수 있습니다. 4xx 는 계약 오류로 보고 재시도하지 않습니다.",
+    "outage": "WCS 접속이 되지 않는 동안 발생한 이벤트는 RB-Y1 내부 대기열에 보관하다가 연결이 복구되는 즉시 발생 순서대로 전송합니다.",
+    "relationToStatus": "완료/실패는 이 콜백과 상태 업로드(work_cycle=DONE/ERROR) 두 경로로 함께 전달됩니다. 오더 단위 판정은 이 콜백을 기준으로 하시면 됩니다."
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "wcsOrderId": "WCS-20260903-000001",
+  "carrierId": "TOTE-000001",
+  "fromStationId": "RACK01_PORT01",
+  "toStationId": "CV02_IN",
+  "priority": 5,
+  "timestamp": "2026-09-03T05:00:00.000Z",
+  "fromLocation": {
+    "bank": 1,
+    "bay": 1,
+    "level": 1
+  }
+}
