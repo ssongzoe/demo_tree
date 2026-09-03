@@ -40,6 +40,9 @@ WCS_BASE_URL=http://<서버PC IP>:5224 DRY_RUN=0 python demo_full_sequence_loop.
 - `DRY_RUN` 기본값이 **true**(`communication/wcs/config.py`)라 실제 통신하려면 반드시 `DRY_RUN=0`.
   DRY_RUN=1이면 오더 서버를 띄우지 않고 가짜 오더가 즉시 발급된 것처럼 동작해 기존과 같은 연속 반복.
 - 로봇 PC의 **5225 포트**가 서버 PC에서 접근 가능해야 한다 (`ROBOT_ORDER_PORT`로 변경 가능).
+- **WCS가 닫혀 있어도 데모는 그대로 시작된다.** 시작 시 health check 실패는 경고 1회만 남기고 진행하며,
+  status는 1Hz로 계속 재시도하다가 서버가 열리면 다음 주기(≤1초)에 `status POST 복구`를 찍고 전송을 재개한다.
+  전송하지 못한 완료/실패(transport-event)는 같은 `eventId`로 큐에 남아 연결되는 즉시 순서대로 전송된다.
 - `--no-wcs-order`: 오더 대기 없이 연속 반복 (기존 동작).
 - 로봇 2대 이상이면 `ROBOT_SERIAL=RBY1-002` 로 구분.
 

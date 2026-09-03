@@ -35,6 +35,7 @@ class WcsClient:
         self._timeout = timeout
         self._dry_run = dry_run
         self._logged_first_ok = False
+        self._status_error_logged = False
         self._transport_event_path = transport_event_path
         self._event_error_logged = False
         self._owns_session = session is None
@@ -50,7 +51,7 @@ class WcsClient:
         try:
             response = self._session.get(self._health_url, timeout=self._timeout)
         except requests.RequestException as error:
-            log.error("WCS health check 실패 (%s): %s", self._health_url, error)
+            log.warning("WCS health check 실패 (%s): %s", self._health_url, error)
             return False
 
         healthy = response.status_code == 200 and _is_healthy_body(response)
@@ -73,24 +74,28 @@ class WcsClient:
         try:
             response = self._session.post(url, json=payload, timeout=self._timeout)
         except requests.RequestException as error:
-            log.warning("WCS status POST 실패: %s", error)
+            # 1Hz로 계속 재시도하므로 같은 오류가 반복되면 첫 1회만 경고로 남긴다.
+            self._log_status_error("WCS status POST 실패 (%s): %s — 연결될 때까지 계속 재시도합니다.",
+                                   url, error)
             return False
 
         if not 200 <= response.status_code < 300:
-            log.warning(
+            self._log_status_error(
                 "WCS status POST -> HTTP %s: %s",
                 response.status_code,
                 response.text.strip()[:160],
             )
             return False
 
-        if not self._logged_first_ok:
-            self._logged_first_ok = True
+        if not self._logged_first_ok or self._status_error_logged:
             log.info(
-                "WCS status POST OK -> HTTP %s %s",
+                "WCS status POST %s -> HTTP %s %s",
+                "복구" if self._status_error_logged else "OK",
                 response.status_code,
                 response.text.strip()[:200],
             )
+            self._logged_first_ok = True
+            self._status_error_logged = False
         else:
             log.debug("WCS status POST -> HTTP %s", response.status_code)
 
@@ -131,6 +136,13 @@ class WcsClient:
     def close(self) -> None:
         if self._owns_session:
             self._session.close()
+
+    def _log_status_error(self, message: str, *args: Any) -> None:
+        if not self._status_error_logged:
+            log.warning(message, *args)
+            self._status_error_logged = True
+        else:
+            log.debug(message, *args)
 
     def _log_event_error(self, message: str, *args: Any) -> None:
         # 재시도 루프에서 같은 오류가 반복되면 첫 1회만 남긴다.

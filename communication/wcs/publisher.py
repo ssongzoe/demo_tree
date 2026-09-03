@@ -51,6 +51,9 @@ class WcsPublisher:
                                              config.ROBOT_ORDER_PATH)
         self._current_order: dict[str, Any] | None = None
         self._dry_run_order_seq = 0
+        # 전송 실패한 transport-event. 전송 스레드가 매 주기 재시도한다(서버가 열리면 즉시 전송).
+        self._pending_events: deque[dict[str, Any]] = deque()
+        self._pending_event_lock = threading.Lock()
 
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -71,9 +74,6 @@ class WcsPublisher:
             if self._thread is not None and self._thread.is_alive():
                 return
 
-            if not self._dry_run and not self._client.check_health():
-                raise ConnectionError("WCS 개발서버에 연결할 수 없습니다.")
-
             self._stop_event.clear()
             self._wake_event.clear()
             self._sent = 0
@@ -86,6 +86,21 @@ class WcsPublisher:
                 self._order_receiver.start()
 
         log.info("WCS publisher 시작: %.1f Hz, serial=%s", 1.0 / self._period, self._serial)
+
+        # WCS가 닫혀 있어도 데모는 계속 진행한다. 확인만 하고 경고를 남기며,
+        # 전송 스레드가 1Hz로 재시도하므로 서버가 열리는 즉시 다음 주기에 전송이 재개된다.
+        # health check는 timeout까지 블록될 수 있으므로 start()를 막지 않도록 별도 스레드에서 확인한다.
+        if not self._dry_run:
+            threading.Thread(target=self._check_health_once, name="wcs-health", daemon=True).start()
+
+    def _check_health_once(self) -> None:
+        try:
+            if not self._client.check_health():
+                log.warning("WCS 개발서버에 연결할 수 없습니다 (%s). "
+                            "데모는 계속 진행하며, 서버가 열리면 자동으로 전송이 재개됩니다.",
+                            config.WCS_BASE_URL)
+        except Exception:  # noqa: BLE001 - health 확인 실패로 데모를 중단하지 않는다.
+            log.exception("WCS health check 중 예외")
 
     def stop(self, *, flush: bool = True) -> None:
         """전송 스레드를 종료하고, flush=True이면 마지막 상태를 한 번 더 전송한다."""
@@ -102,7 +117,13 @@ class WcsPublisher:
             return
 
         if flush:
+            self._drain_pending_events()
             self._publish_due(force_current=True)
+
+        with self._pending_event_lock:
+            pending = len(self._pending_events)
+        if pending:
+            log.warning("전송하지 못한 transport-event %d건이 남은 채 종료합니다.", pending)
 
         with self._lifecycle_lock:
             if self._thread is thread:
@@ -177,8 +198,7 @@ class WcsPublisher:
         """현재 오더를 FAILED로 WCS에 보고한다. 진행 중인 오더가 없으면 아무것도 하지 않는다."""
         return self._report_order_event("FAILED", "FAILED", message)
 
-    def _report_order_event(self, event_type: str, result: str, message: str | None,
-                            attempts: int = 3) -> bool:
+    def _report_order_event(self, event_type: str, result: str, message: str | None) -> bool:
         order = self._current_order
         if order is None:
             log.debug("보고할 진행 중 오더가 없습니다 (%s)", event_type)
@@ -195,21 +215,38 @@ class WcsPublisher:
             "occurredAt": _now_iso(),
         }
 
-        # WCS가 eventId로 멱등 처리하므로 같은 eventId로 몇 번 재시도해도 안전하다.
-        succeeded = False
-        for attempt in range(1, attempts + 1):
-            if self._client.post_transport_event(body):
-                succeeded = True
-                break
-            if attempt < attempts:
-                time.sleep(1.0)
-
-        if not succeeded:
-            log.error("transport-event 보고 실패: %s %s (%d회 시도)", event_type, order_id, attempts)
-
         self._order_receiver.set_status(order_id, event_type)
         self._current_order = None
-        return succeeded
+
+        # 실패해도 데모를 막지 않는다. eventId를 유지한 채 큐에 넣어두면
+        # 전송 스레드가 매 주기 재시도하므로 WCS가 열리는 즉시 전송된다(중복은 eventId로 멱등).
+        if self._client.post_transport_event(body):
+            return True
+
+        with self._pending_event_lock:
+            self._pending_events.append(body)
+            pending = len(self._pending_events)
+        log.warning("transport-event 전송 실패 -> 재시도 대기열에 넣었습니다: %s %s (대기 %d건)",
+                    event_type, order_id, pending)
+        return False
+
+    def _drain_pending_events(self) -> None:
+        """전송 실패한 transport-event를 순서대로 다시 보낸다. 하나라도 실패하면 다음 주기로 미룬다."""
+        while True:
+            with self._pending_event_lock:
+                if not self._pending_events:
+                    return
+                body = self._pending_events[0]
+
+            if not self._client.post_transport_event(body):
+                return
+
+            with self._pending_event_lock:
+                if self._pending_events and self._pending_events[0] is body:
+                    self._pending_events.popleft()
+                remaining = len(self._pending_events)
+            log.info("대기 중이던 transport-event 전송 완료: %s %s (남은 %d건)",
+                     body["eventType"], body["wcsOrderId"], remaining)
 
     def _run(self) -> None:
         next_upload = time.monotonic()
@@ -223,6 +260,7 @@ class WcsPublisher:
                 break
 
             try:
+                self._drain_pending_events()
                 self._publish_due(force_current=False)
             except Exception:  # noqa: BLE001 - 전송 스레드는 다음 heartbeat에서 계속 재시도한다.
                 log.exception("WCS publisher 반복 처리 실패")
