@@ -42,7 +42,9 @@ WCS_BASE_URL=http://<서버PC IP>:5224 DRY_RUN=0 python demo_full_sequence_loop.
 - 로봇 PC의 **5225 포트**가 서버 PC에서 접근 가능해야 한다 (`ROBOT_ORDER_PORT`로 변경 가능).
 - **WCS가 닫혀 있어도 데모는 그대로 시작된다.** 시작 시 health check 실패는 경고 1회만 남기고 진행하며,
   status는 1Hz로 계속 재시도하다가 서버가 열리면 다음 주기(≤1초)에 `status POST 복구`를 찍고 전송을 재개한다.
-  전송하지 못한 완료/실패(transport-event)는 같은 `eventId`로 큐에 남아 연결되는 즉시 순서대로 전송된다.
+  전송하지 못한 완료/실패(transport-event)와 `work_cycle` 전환은 큐에 남아 연결되는 즉시 순서대로 전송된다
+  (transport-event는 같은 `eventId` 유지). 큐는 **각각 최대 10건**이고 넘치면 가장 오래된 것부터 버리며 경고를 남긴다
+  (`PENDING_EVENT_MAXLEN` / `WORK_EVENT_MAXLEN`). 로봇 상태 스냅샷은 최신 1건만 유지하므로 쌓이지 않는다.
 - `--no-wcs-order`: 오더 대기 없이 연속 반복 (기존 동작).
 - 로봇 2대 이상이면 `ROBOT_SERIAL=RBY1-002` 로 구분.
 

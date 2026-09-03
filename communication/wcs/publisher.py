@@ -18,6 +18,11 @@ from .state import WcsStateStore
 
 log = logging.getLogger(__name__)
 
+# WCS 연결이 끊긴 동안 로봇에 쌓아 두는 최대 건수. 넘치면 가장 오래된 것부터 버린다.
+# (로봇 상태 스냅샷은 최신 1건만 유지하므로 여기에 쌓이지 않는다.)
+PENDING_EVENT_MAXLEN = 10   # 미전송 transport-event (COMPLETED/FAILED)
+WORK_EVENT_MAXLEN = 10      # 미전송 work_cycle 전환
+
 
 class WcsPublisher:
     """RobotState는 빠르게 캐시하고, 최신 상태를 지정된 주기로 WCS에 전송한다."""
@@ -52,7 +57,7 @@ class WcsPublisher:
         self._current_order: dict[str, Any] | None = None
         self._dry_run_order_seq = 0
         # 전송 실패한 transport-event. 전송 스레드가 매 주기 재시도한다(서버가 열리면 즉시 전송).
-        self._pending_events: deque[dict[str, Any]] = deque()
+        self._pending_events: deque[dict[str, Any]] = deque(maxlen=PENDING_EVENT_MAXLEN)
         self._pending_event_lock = threading.Lock()
 
         self._stop_event = threading.Event()
@@ -60,7 +65,7 @@ class WcsPublisher:
         self._lifecycle_lock = threading.Lock()
         self._publish_lock = threading.Lock()
         self._work_event_lock = threading.Lock()
-        self._work_events: deque[tuple[str, str | None]] = deque()
+        self._work_events: deque[tuple[str, str | None]] = deque(maxlen=WORK_EVENT_MAXLEN)
         self._thread: threading.Thread | None = None
 
         self._sent = 0
@@ -153,10 +158,17 @@ class WcsPublisher:
         self._state.set_work_state(cycle, error_message)
         work_event = self._state.get_work_state()
 
+        dropped: tuple[str, str | None] | None = None
         with self._work_event_lock:
             if not self._work_events or self._work_events[-1] != work_event:
+                # maxlen을 넘으면 deque가 가장 오래된 항목을 조용히 버리므로 미리 확인해 로그를 남긴다.
+                if len(self._work_events) == WORK_EVENT_MAXLEN:
+                    dropped = self._work_events[0]
                 self._work_events.append(work_event)
 
+        if dropped is not None:
+            log.warning("미전송 work_cycle 대기열이 가득 차 가장 오래된 항목을 버립니다: %s (최대 %d건)",
+                        dropped[0], WORK_EVENT_MAXLEN)
         self._wake_event.set()
 
     # ── 반송 오더 (WCS → 로봇 push, 로봇 → WCS 이벤트 콜백) ──────────────────
@@ -223,11 +235,18 @@ class WcsPublisher:
         if self._client.post_transport_event(body):
             return True
 
+        dropped: dict[str, Any] | None = None
         with self._pending_event_lock:
+            if len(self._pending_events) == PENDING_EVENT_MAXLEN:
+                dropped = self._pending_events[0]
             self._pending_events.append(body)
             pending = len(self._pending_events)
-        log.warning("transport-event 전송 실패 -> 재시도 대기열에 넣었습니다: %s %s (대기 %d건)",
-                    event_type, order_id, pending)
+
+        log.warning("transport-event 전송 실패 -> 재시도 대기열에 넣었습니다: %s %s (대기 %d/%d건)",
+                    event_type, order_id, pending, PENDING_EVENT_MAXLEN)
+        if dropped is not None:
+            log.warning("대기열이 가득 차 가장 오래된 transport-event를 버립니다: %s %s",
+                        dropped["eventType"], dropped["wcsOrderId"])
         return False
 
     def _drain_pending_events(self) -> None:
@@ -295,7 +314,9 @@ class WcsPublisher:
                 return attempted
 
             with self._work_event_lock:
-                self._work_events.popleft()
+                # 전송 중 대기열이 가득 차 맨 앞이 밀려났을 수 있으므로 같은 항목일 때만 제거한다.
+                if self._work_events and self._work_events[0] == (work_cycle, error_message):
+                    self._work_events.popleft()
 
     def _publish_current(self) -> bool:
         snapshot = self._state.latest_robot()
