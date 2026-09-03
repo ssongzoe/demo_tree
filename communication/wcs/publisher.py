@@ -5,11 +5,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import uuid
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any
 
 from . import config
 from .client import WcsClient
+from .order_server import OrderReceiver
 from .payload import build_status_payload
 from .state import WcsStateStore
 
@@ -41,10 +44,13 @@ class WcsPublisher:
             config.WCS_STATUS_PATH,
             config.HTTP_TIMEOUT_SEC,
             dry_run=dry_run,
-            command_path=config.WCS_COMMAND_PATH,
+            transport_event_path=config.WCS_TRANSPORT_EVENT_PATH,
         )
-        self._command_poll_period = 1.0 / config.COMMAND_POLL_HZ
-        self._last_command_id = 0
+        # WCS → 로봇 반송 오더 수신 (AMR Transport Order 규격 준용). DRY_RUN이면 띄우지 않는다.
+        self._order_receiver = OrderReceiver(config.ROBOT_ORDER_BIND, config.ROBOT_ORDER_PORT,
+                                             config.ROBOT_ORDER_PATH)
+        self._current_order: dict[str, Any] | None = None
+        self._dry_run_order_seq = 0
 
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -76,6 +82,9 @@ class WcsPublisher:
             self._thread.start()
             self._wake_event.set()
 
+            if not self._dry_run:
+                self._order_receiver.start()
+
         log.info("WCS publisher 시작: %.1f Hz, serial=%s", 1.0 / self._period, self._serial)
 
     def stop(self, *, flush: bool = True) -> None:
@@ -99,6 +108,7 @@ class WcsPublisher:
             if self._thread is thread:
                 self._thread = None
 
+        self._order_receiver.stop()
         log.info("WCS publisher 종료: sent=%d failed=%d", self._sent, self._failed)
 
     def on_state(self, state: Any, *_: Any) -> None:
@@ -128,40 +138,78 @@ class WcsPublisher:
 
         self._wake_event.set()
 
-    def wait_for_command(
+    # ── 반송 오더 (WCS → 로봇 push, 로봇 → WCS 이벤트 콜백) ──────────────────
+    def wait_for_order(
         self,
-        command: str = "START",
         *,
         timeout: float | None = None,
         stop_event: threading.Event | None = None,
     ) -> dict[str, Any] | None:
-        """호출 스레드에서 WCS 명령을 폴링해 새 commandId의 `command`가 오면 그 명령을 돌려준다.
+        """WCS가 POST한 반송 오더를 하나 꺼내 현재 오더로 잡는다.
 
-        전송 스레드와는 독립이다. timeout 초과 또는 stop_event가 set되면 None.
-        같은 commandId는 한 번만 소비하므로 이미 처리한 START를 다시 받지 않는다.
+        호출 스레드에서 블록한다. timeout 초과 또는 stop_event가 set되면 None.
+        DRY_RUN이면 서버 없이도 데모가 돌도록 가짜 오더를 즉시 돌려준다.
         """
-        wanted = command.strip().upper()
-        deadline = None if timeout is None else time.monotonic() + timeout
-
-        while True:
-            if stop_event is not None and stop_event.is_set():
+        if self._dry_run:
+            self._dry_run_order_seq += 1
+            order = {"wcsOrderId": f"DRYRUN-{self._dry_run_order_seq:06d}", "carrierId": None,
+                     "fromStationId": "DRYRUN_FROM", "toStationId": "DRYRUN_TO", "priority": 0,
+                     "timestamp": _now_iso()}
+            log.info("[DRY_RUN] 반송 오더 대기 생략 -> %s", order["wcsOrderId"])
+        else:
+            order = self._order_receiver.wait_for_order(timeout=timeout, stop_event=stop_event)
+            if order is None:
                 return None
-            if deadline is not None and time.monotonic() >= deadline:
-                return None
+            log.info("반송 오더 시작: %s (%s -> %s)", order["wcsOrderId"],
+                     order.get("fromStationId"), order.get("toStationId"))
 
-            body = self._client.get_command(self._serial)
-            if body is not None:
-                command_id = _int_or_none(body.get("commandId"))
-                received = str(body.get("command", "")).strip().upper()
-                if received == wanted and command_id is not None and command_id > self._last_command_id:
-                    self._last_command_id = command_id
-                    log.info("WCS 명령 수신: %s (commandId=%d)", received, command_id)
-                    return body
+        self._current_order = order
+        return dict(order)
 
-            if stop_event is not None:
-                stop_event.wait(self._command_poll_period)
-            else:
-                time.sleep(self._command_poll_period)
+    def current_order(self) -> dict[str, Any] | None:
+        return dict(self._current_order) if self._current_order else None
+
+    def complete_order(self) -> bool:
+        """현재 오더를 COMPLETED로 WCS에 보고한다."""
+        return self._report_order_event("COMPLETED", "SUCCESS", None)
+
+    def fail_order(self, message: str | None) -> bool:
+        """현재 오더를 FAILED로 WCS에 보고한다. 진행 중인 오더가 없으면 아무것도 하지 않는다."""
+        return self._report_order_event("FAILED", "FAILED", message)
+
+    def _report_order_event(self, event_type: str, result: str, message: str | None,
+                            attempts: int = 3) -> bool:
+        order = self._current_order
+        if order is None:
+            log.debug("보고할 진행 중 오더가 없습니다 (%s)", event_type)
+            return False
+
+        order_id = str(order["wcsOrderId"])
+        body = {
+            "eventId": uuid.uuid4().hex,
+            "wcsOrderId": order_id,
+            "eventType": event_type,
+            "robotSerial": self._serial,
+            "result": result,
+            "message": (message or "").strip()[:200] or None,
+            "occurredAt": _now_iso(),
+        }
+
+        # WCS가 eventId로 멱등 처리하므로 같은 eventId로 몇 번 재시도해도 안전하다.
+        succeeded = False
+        for attempt in range(1, attempts + 1):
+            if self._client.post_transport_event(body):
+                succeeded = True
+                break
+            if attempt < attempts:
+                time.sleep(1.0)
+
+        if not succeeded:
+            log.error("transport-event 보고 실패: %s %s (%d회 시도)", event_type, order_id, attempts)
+
+        self._order_receiver.set_status(order_id, event_type)
+        self._current_order = None
+        return succeeded
 
     def _run(self) -> None:
         next_upload = time.monotonic()
@@ -255,8 +303,5 @@ class WcsPublisher:
             self._waiting_logged = True
 
 
-def _int_or_none(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")

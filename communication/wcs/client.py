@@ -22,7 +22,7 @@ class WcsClient:
         *,
         dry_run: bool = False,
         session: requests.Session | None = None,
-        command_path: str | None = None,
+        transport_event_path: str | None = None,
     ) -> None:
         if not base_url.strip():
             raise ValueError("WCS base_url이 비어 있습니다.")
@@ -35,9 +35,8 @@ class WcsClient:
         self._timeout = timeout
         self._dry_run = dry_run
         self._logged_first_ok = False
-        self._command_path = command_path
-        self._command_error_logged = False
-        self._dry_run_command_id = 0
+        self._transport_event_path = transport_event_path
+        self._event_error_logged = False
         self._owns_session = session is None
         self._session = session or requests.Session()
         self._session.headers.update({"Content-Type": "application/json; charset=utf-8"})
@@ -97,54 +96,47 @@ class WcsClient:
 
         return True
 
-    def get_command(self, serial: str) -> dict[str, Any] | None:
-        """WCS 작업 명령 한 건을 조회한다. 실패하면 None (호출부가 다음 주기에 재시도).
+    def post_transport_event(self, payload: dict[str, Any]) -> bool:
+        """반송 완료/실패 이벤트 한 건을 WCS에 콜백한다 (AMR transport-events 규격 준용).
 
-        응답 규격(테스트용): {"commandId": int, "command": "START"|"WAIT", "issuedAt": str}
-        DRY_RUN이면 서버 없이도 데모가 돌도록 매번 새 commandId의 START를 돌려준다.
+        payload: {eventId, wcsOrderId, eventType, robotSerial, result, message, occurredAt}
+        2xx면 True. WCS는 eventId 기준으로 중복을 멱등 처리하므로 재시도해도 안전하다.
         """
-        if self._command_path is None:
-            return None
+        if self._transport_event_path is None:
+            log.warning("transport_event_path가 설정되지 않아 이벤트를 보내지 않습니다.")
+            return False
 
+        url = self._join_url(self._transport_event_path)
         if self._dry_run:
-            self._dry_run_command_id += 1
-            log.info("[DRY_RUN] 명령 조회 생략 -> START (commandId=%d)", self._dry_run_command_id)
-            return {"commandId": self._dry_run_command_id, "command": "START", "issuedAt": None}
+            log.info("[DRY_RUN] POST %s\n%s", url, json.dumps(payload, ensure_ascii=False, indent=2))
+            return True
 
-        url = self._join_url(self._command_path.format(serial=quote(serial, safe="")))
         try:
-            response = self._session.get(url, timeout=self._timeout)
+            response = self._session.post(url, json=payload, timeout=self._timeout)
         except requests.RequestException as error:
-            self._log_command_error("WCS 명령 조회 실패: %s", error)
-            return None
+            self._log_event_error("WCS transport-event POST 실패: %s", error)
+            return False
 
         if not 200 <= response.status_code < 300:
-            self._log_command_error("WCS 명령 조회 -> HTTP %s: %s",
-                                    response.status_code, response.text.strip()[:160])
-            return None
+            self._log_event_error("WCS transport-event POST -> HTTP %s: %s",
+                                  response.status_code, response.text.strip()[:160])
+            return False
 
-        try:
-            body = response.json()
-        except ValueError:
-            self._log_command_error("WCS 명령 응답이 JSON이 아닙니다: %r", response.text.strip()[:160])
-            return None
-
-        if not isinstance(body, dict) or "command" not in body:
-            self._log_command_error("WCS 명령 응답 형식 오류: %r", body)
-            return None
-
-        self._command_error_logged = False
-        return body
+        self._event_error_logged = False
+        log.info("WCS transport-event OK: %s %s -> HTTP %s %s",
+                 payload.get("eventType"), payload.get("wcsOrderId"),
+                 response.status_code, response.text.strip()[:120])
+        return True
 
     def close(self) -> None:
         if self._owns_session:
             self._session.close()
 
-    def _log_command_error(self, message: str, *args: Any) -> None:
-        # 1Hz 폴링이므로 같은 오류가 반복되면 첫 1회만 남긴다.
-        if not self._command_error_logged:
+    def _log_event_error(self, message: str, *args: Any) -> None:
+        # 재시도 루프에서 같은 오류가 반복되면 첫 1회만 남긴다.
+        if not self._event_error_logged:
             log.warning(message, *args)
-            self._command_error_logged = True
+            self._event_error_logged = True
 
     def _status_url(self, serial: str) -> str:
         encoded_serial = quote(serial, safe="")

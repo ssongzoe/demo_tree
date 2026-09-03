@@ -17,6 +17,18 @@ def _positive_float(key: str, default: float) -> float:
     return value
 
 
+def _port(key: str, default: int) -> int:
+    raw = os.getenv(key, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{key}는 정수여야 합니다: {raw!r}") from error
+
+    if not 1 <= value <= 65535:
+        raise ValueError(f"{key}는 1~65535 사이여야 합니다: {value}")
+    return value
+
+
 def _bool(key: str, default: bool) -> bool:
     raw = os.getenv(key, str(default)).strip().lower()
     if raw in ("1", "true", "yes", "y", "on"):
@@ -30,11 +42,14 @@ def _bool(key: str, default: bool) -> bool:
 WCS_BASE_URL = os.getenv("WCS_BASE_URL", "http://210.101.65.119:5224")
 WCS_HEALTH_PATH = os.getenv("WCS_HEALTH_PATH", "/health")
 WCS_STATUS_PATH = os.getenv("WCS_STATUS_PATH", "/api/v1/rb/rby1/status")
+# 반송 완료/실패 보고 (AMR FRS→WCS transport-events callback 규격 준용)
+WCS_TRANSPORT_EVENT_PATH = os.getenv("WCS_TRANSPORT_EVENT_PATH", "/api/v1/rb/transport-events")
 HTTP_TIMEOUT_SEC = _positive_float("HTTP_TIMEOUT_SEC", 5.0)
 
-# 작업 명령 수신 (테스트용 가짜 WCS: tools/fake_wcs/server.py). {serial}은 URL-quote된 robotSerial로 치환된다.
-WCS_COMMAND_PATH = os.getenv("WCS_COMMAND_PATH", "/api/v1/rb/rby1/command/{serial}")
-COMMAND_POLL_HZ = _positive_float("COMMAND_POLL_HZ", 1.0)
+# 로봇 측 반송 오더 수신 서버 (WCS → RBY1). AMR FRS의 POST /api/v1/wcs/transport-orders 규격 준용.
+ROBOT_ORDER_BIND = os.getenv("ROBOT_ORDER_BIND", "0.0.0.0")
+ROBOT_ORDER_PORT = _port("ROBOT_ORDER_PORT", 5225)
+ROBOT_ORDER_PATH = os.getenv("ROBOT_ORDER_PATH", "/api/v1/wcs/transport-orders")
 
 # 전송 대상과 heartbeat 주기
 ROBOT_SERIAL = os.getenv("ROBOT_SERIAL", "RBY1-001")
