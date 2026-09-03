@@ -46,8 +46,38 @@ WCS_BASE_URL=http://<서버PC IP>:5224 DRY_RUN=0 python demo_full_sequence_loop.
 ### 3. 로봇 없이 서버만 검증
 
 ```bash
-DRY_RUN=0 python tools/fake_wcs/sim_robot.py --work-sec 3          # 무한 반복
-DRY_RUN=0 python tools/fake_wcs/sim_robot.py --error "테스트 오류"   # FAILED → 서버 HALTED → 대시보드 [재개]
+DRY_RUN=0 python tools/fake_wcs/sim_robot.py --work-sec 3 --cycles 2   # 2사이클 후 종료 (--cycles 0: 무한)
+DRY_RUN=0 python tools/fake_wcs/sim_robot.py --error "테스트 오류"       # FAILED → 서버 HALTED → 대시보드 [재개]
+```
+
+`DRY_RUN=0`을 빼면(기본 true) 아무것도 보내지 않는다. 정상이면 가짜 로봇 로그가 아래 순서로 흐른다:
+
+```
+WCS health check: HTTP 200 -> OK                              로봇→서버 GET /health
+반송 오더 수신 서버 시작: http://0.0.0.0:5225/...              로봇 측 오더 서버 오픈
+WCS status POST OK -> HTTP 201                                 로봇→서버 상태 업로드 (이후 1Hz)
+반송 오더 수신: WCS-20260903-000001 (RACK01_PORT01 -> CV02_IN)  서버→로봇 오더 POST
+사이클 1 시작 … 사이클 1 완료
+WCS transport-event OK: COMPLETED WCS-…-000001 -> HTTP 200     로봇→서버 완료 콜백
+(서버가 COOLDOWN 후 오더 #2 발행 → 반복)
+WCS publisher 종료: sent=N failed=0
+```
+
+서버 로그에는 `[READY -> RUNNING] 오더 발행 … ACCEPTED` → `transport-event 수신: COMPLETED` → `[RUNNING -> COOLDOWN]` 전이가 찍힌다.
+로봇이 아직 안 떠 있을 때 서버가 "로봇 오더 서버에 연결할 수 없습니다 — 2초마다 재시도"를 내는 것은 정상이다.
+
+### 4. curl로 개별 엔드포인트 확인
+
+```bash
+curl localhost:5224/health                                          # healthy
+curl localhost:5224/api/test/state | python3 -m json.tool            # 서버 상태·오더/이벤트 이력 JSON
+curl localhost:5224/api/v1/rb/rby1/status/RBY1-001/latest            # 마지막 수신 status 레코드
+curl -X POST localhost:5224/api/test/resume                          # HALTED 해제
+
+# 로봇 오더 서버가 떠 있을 때(sim_robot 또는 데모 실행 중) 오더를 직접 POST
+curl -X POST localhost:5225/api/v1/wcs/transport-orders -H 'Content-Type: application/json' \
+  -d '{"wcsOrderId":"T-1","carrierId":"TOTE-1","fromStationId":"RACK01_PORT01","toStationId":"CV02_IN","priority":5,"timestamp":"x"}'
+# → 201 ACCEPTED. 같은 내용 재전송 → 200(멱등). toStationId를 바꿔 재전송 → 409 DUPLICATE_ORDER_CONFLICT
 ```
 
 ## 시퀀스
