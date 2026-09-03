@@ -63,7 +63,7 @@
     }
   },
   "x-behavior": {
-    "delivery": "at-least-once. 네트워크 오류 또는 5xx 응답이면 RB-Y1이 동일한 eventId 로 1초 간격으로 재시도하므로, 같은 이벤트를 두 번 이상 수신하실 수 있습니다. 4xx 는 계약 오류로 보고 재시도하지 않습니다.",
+    "delivery": "at-least-once. 네트워크 오류 또는 5xx 응답이면 RB-Y1이 동일한 eventId 로 1초 간격으로 재시도하므로, 같은 이벤트를 두 번 이상 수신하실 수 있습니다. 4xx 는 오류로 보고 재시도하지 않습니다.",
     "relationToStatus": "완료/실패는 이 콜백과 상태 업로드(work_cycle=DONE/ERROR) 두 경로로 함께 전달됩니다. 오더 단위 판정은 이 콜백을 기준으로 하시면 됩니다."
   }
 }

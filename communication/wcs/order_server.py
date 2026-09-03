@@ -27,6 +27,8 @@ from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
+# 오더에서 사용하는 필드. 이 외의 필드가 들어와도 접수는 하되 저장·사용하지 않는다.
+ORDER_FIELDS = ("wcsOrderId", "carrierId", "fromStationId", "toStationId", "priority", "timestamp")
 REQUIRED_FIELDS = ("wcsOrderId", "fromStationId", "toStationId")
 # 멱등 판정에 쓰는 필드. timestamp는 재전송마다 달라질 수 있으므로 제외한다.
 COMPARE_FIELDS = ("carrierId", "fromStationId", "toStationId", "priority")
@@ -116,6 +118,10 @@ class OrderReceiver:
                          "timestamp": _now_iso()}
 
         order_id = str(body["wcsOrderId"])
+        unknown = [key for key in body if key not in ORDER_FIELDS]
+        if unknown:
+            log.info("오더 %s: 사용하지 않는 필드는 무시합니다: %s", order_id, ", ".join(unknown))
+
         with self._lock:
             existing = self._orders.get(order_id)
             if existing is not None:
@@ -128,7 +134,7 @@ class OrderReceiver:
                              "message": "The wcsOrderId already exists with different order data.",
                              "timestamp": _now_iso()}
 
-            record = {"request": dict(body), "status": "ACCEPTED", "acceptedAt": _now_iso()}
+            record = {"request": _use_fields(body), "status": "ACCEPTED", "acceptedAt": _now_iso()}
             self._orders[order_id] = record
             self._queue.append(record)
             self._arrived.notify_all()
@@ -167,3 +173,8 @@ class OrderReceiver:
     @staticmethod
     def _accept_body(order_id: str, status: str) -> dict[str, Any]:
         return {"wcsOrderId": order_id, "orderStatus": status, "timestamp": _now_iso()}
+
+
+def _use_fields(body: dict[str, Any]) -> dict[str, Any]:
+    """오더에서 실제로 사용하는 필드만 추린다(정의 순서 유지)."""
+    return {field: body[field] for field in ORDER_FIELDS if field in body}

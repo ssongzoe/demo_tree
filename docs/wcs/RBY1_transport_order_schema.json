@@ -2,10 +2,10 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "RBY1_transport_order_schema.json",
   "title": "RB-Y1 반송 오더 (WCS → RB-Y1)",
-  "description": "SFA WCS가 RB-Y1에 작업을 지시하는 요청 body. SFA-WCS 규격서 v07.2 '4. Transport Order 생성 API'를 RB-Y1에 맞게 축소한 것입니다. 전송: POST http://{RB-Y1_HOST}:5225/api/v1/wcs/transport-orders, Content-Type: application/json; charset=utf-8, 헤더 X-Correlation-Id 에 wcsOrderId 와 동일한 값 권장.",
+  "description": "SFA WCS가 RB-Y1에 작업을 지시하는 요청 body. SFA-WCS 규격서 v07.2 '4. Transport Order 생성 API'를 RB-Y1에 맞게 축소한 것입니다. 사용 필드는 아래 6개가 전부이며, 규격서 4.3의 fromLocation/toLocation 은 RB-Y1에서 사용하지 않습니다. 전송: POST http://{RB-Y1_HOST}:5225/api/v1/wcs/transport-orders, Content-Type: application/json; charset=utf-8, 헤더 X-Correlation-Id 에 wcsOrderId 와 동일한 값 권장.",
   "type": "object",
   "required": ["wcsOrderId", "fromStationId", "toStationId"],
-  "additionalProperties": true,
+  "additionalProperties": false,
   "properties": {
     "wcsOrderId": {
       "type": "string",
@@ -40,22 +40,9 @@
       "format": "date-time",
       "description": "WCS 요청 시각. ISO 8601 UTC.",
       "examples": ["2026-09-03T05:00:00.000Z"]
-    },
-    "toLocation": {
-      "$ref": "#/definitions/location",
-      "description": "향후 확장용 도착 세부 위치. RB-Y1은 참조만 하며 없어도 오더를 접수합니다."
     }
   },
   "definitions": {
-    "location": {
-      "type": "object",
-      "description": "Rack 세부 위치. 현재 단계에서는 값을 넣지 않아도 되며, 넣는 경우 1/1/1 고정입니다.",
-      "properties": {
-        "bank": { "type": "integer", "examples": [1] },
-        "bay": { "type": "integer", "examples": [1] },
-        "level": { "type": "integer", "examples": [1] }
-      }
-    },
     "acceptedResponse": {
       "type": "object",
       "title": "정상 응답 (HTTP 201 신규 접수 / HTTP 200 동일 오더 재전송)",
@@ -88,6 +75,7 @@
     }
   },
   "x-behavior": {
+    "fields": "위 6개 필드만 사용합니다. 그 외 필드가 포함되어도 RB-Y1은 오더를 접수하되 해당 값은 무시하고 저장하지 않습니다.",
     "idempotency": "동일 wcsOrderId 로 같은 내용을 재전송하면 새 작업을 생성하지 않고 HTTP 200 과 현재 상태를 반환합니다. 내용이 다르면 HTTP 409 입니다. 멱등 비교 대상은 carrierId, fromStationId, toStationId, priority 이며 timestamp 는 비교하지 않습니다.",
     "queueing": "RB-Y1은 접수한 오더를 순서대로 1건씩 수행합니다. 이전 작업 수행 중에 도착한 오더도 ACCEPTED 로 접수되어 대기합니다.",
     "progress": "작업 진행 상태는 별도 이벤트 없이 기존 상태 업로드(POST /api/v1/rb/rby1/status, 1Hz)의 robot_state.work_cycle 값(IDLE/WORKING/DONE/ERROR)으로 확인하실 수 있습니다.",
