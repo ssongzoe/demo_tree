@@ -10,7 +10,7 @@
     "wcsOrderId": {
       "type": "string",
       "minLength": 1,
-      "description": "WCS가 생성한 전역 고유 작업번호. RB-Y1은 이 값을 유일 식별자로 사용하며 별도의 내부 orderId를 두지 않습니다(규격서 4.4 SFA 추가 사항 반영).",
+      "description": "WCS가 생성한 전역 고유 작업번호.",
       "examples": ["WCS-20260903-000001"]
     },
     "carrierId": {
@@ -21,13 +21,13 @@
     "fromStationId": {
       "type": "string",
       "minLength": 1,
-      "description": "출발 Station ID. 규격서 8. Station ID 및 Node 매핑의 고정 ID를 사용합니다.",
+      "description": "출발 Station ID. RB-Y1은 참조만 하며 없어도 오더를 접수합니다.",
       "examples": ["RACK01_PORT01", "CV02_OUT", "CV03_OUT"]
     },
     "toStationId": {
       "type": "string",
       "minLength": 1,
-      "description": "도착 Station ID.",
+      "description": "도착 Station ID. RB-Y1은 참조만 하며 없어도 오더를 접수합니다.",
       "examples": ["CV02_IN", "CV03_IN", "RACK01_PORT01"]
     },
     "priority": {
@@ -41,13 +41,9 @@
       "description": "WCS 요청 시각. ISO 8601 UTC.",
       "examples": ["2026-09-03T05:00:00.000Z"]
     },
-    "fromLocation": {
-      "$ref": "#/definitions/location",
-      "description": "향후 확장용 출발 세부 위치. fromStationId 가 RACKxx_PORTxx 인 경우에만 사용하며 현재는 bank/bay/level 을 모두 1로 고정합니다."
-    },
     "toLocation": {
       "$ref": "#/definitions/location",
-      "description": "향후 확장용 도착 세부 위치. 적용 조건은 fromLocation 과 동일합니다."
+      "description": "향후 확장용 도착 세부 위치. RB-Y1은 참조만 하며 없어도 오더를 접수합니다."
     }
   },
   "definitions": {
