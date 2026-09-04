@@ -122,9 +122,9 @@
       "body": { "errorCode": "DUPLICATE_ORDER_CONFLICT", "message": "The wcsOrderId already exists with different order data.", "timestamp": "2026-09-03T05:00:31.000Z" }
     },
     {
-      "case": "필수값 누락",
+      "case": "wcsOrderId 누락 (그 외 필드는 없어도 접수됩니다)",
       "http": 400,
-      "body": { "errorCode": "INVALID_REQUEST", "message": "missing fields: fromStationId, toStationId", "timestamp": "2026-09-03T05:00:32.000Z" }
+      "body": { "errorCode": "INVALID_REQUEST", "message": "missing fields: wcsOrderId", "timestamp": "2026-09-03T05:00:32.000Z" }
     }
   ]
 }

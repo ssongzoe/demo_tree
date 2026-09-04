@@ -11,7 +11,8 @@ WCS가 로봇 측으로 오더를 POST하고, 로봇은 즉시 ACCEPTED로 응�
     -> 201 { "wcsOrderId": ..., "orderStatus": "ACCEPTED", "timestamp": ... }
        200 동일 wcsOrderId·동일 내용 재전송 (현재 상태 반환, 멱등)
        409 DUPLICATE_ORDER_CONFLICT 동일 wcsOrderId·다른 내용
-       400 INVALID_REQUEST 필수값 누락
+       400 INVALID_REQUEST wcsOrderId 누락 또는 JSON 형식 오류
+             (carrierId/fromStationId/toStationId/priority/timestamp는 참조용이라 없어도 접수한다)
 """
 
 from __future__ import annotations
@@ -29,7 +30,8 @@ log = logging.getLogger(__name__)
 
 # 오더에서 사용하는 필드. 이 외의 필드가 들어와도 접수는 하되 저장·사용하지 않는다.
 ORDER_FIELDS = ("wcsOrderId", "carrierId", "fromStationId", "toStationId", "priority", "timestamp")
-REQUIRED_FIELDS = ("wcsOrderId", "fromStationId", "toStationId")
+# 필수는 오더 식별자뿐이다. Station ID 등 나머지는 참조용이라 없어도 접수한다.
+REQUIRED_FIELDS = ("wcsOrderId",)
 # 멱등 판정에 쓰는 필드. timestamp는 재전송마다 달라질 수 있으므로 제외한다.
 COMPARE_FIELDS = ("carrierId", "fromStationId", "toStationId", "priority")
 
