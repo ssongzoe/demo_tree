@@ -21,8 +21,8 @@
     },
     "eventType": {
       "type": "string",
-      "enum": ["COMPLETED", "FAILED"],
-      "description": "RB-Y1은 최종 결과 2종만 보고합니다. ",
+      "enum": ["COMPLETED", "FAILED", "CANCELED"],
+      "description": "RB-Y1은 최종 결과 3종만 보고합니다. CANCELED는 취소 요청(4.8) 접수 후 안전 정지를 마친 시점에 전송됩니다.",
       "examples": ["COMPLETED"]
     },
     "robotSerial": {
@@ -33,7 +33,7 @@
     "result": {
       "type": "string",
       "enum": ["SUCCESS", "FAILED"],
-      "description": "eventType 과 대응합니다. COMPLETED → SUCCESS, FAILED → FAILED.",
+      "description": "eventType 과 대응합니다. COMPLETED/CANCELED → SUCCESS, FAILED → FAILED.",
       "examples": ["SUCCESS"]
     },
     "message": {

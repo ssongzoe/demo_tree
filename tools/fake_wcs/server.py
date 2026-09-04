@@ -10,6 +10,8 @@ WCS가 로봇 측 오더 서버에 오더를 POST(push)하고, 로봇이 완료/
     READY ──(오더 POST → 로봇 ACCEPTED)──> RUNNING
     RUNNING ──(COMPLETED 콜백)──> COOLDOWN(15초) ──(만료)──> READY (다음 오더 발행)
     RUNNING ──(FAILED 콜백)──> HALTED ──(대시보드 [재개] / POST /api/test/resume)──> READY
+    RUNNING ──(대시보드 [취소] / POST /api/test/cancel → 로봇에 취소 POST)──> CANCEL_REQUESTED
+    CANCEL_REQUESTED ──(CANCELED 콜백)──> COOLDOWN ──> READY
     로봇에 연결이 안 되면 READY에서 2초마다 재시도한다.
 
 로봇 → WCS (실 WCS 호환):
@@ -19,8 +21,9 @@ WCS가 로봇 측 오더 서버에 오더를 POST(push)하고, 로봇이 완료/
     GET  /api/v1/rb/rby1/status/{serial}/latest | /history?limit=N
 WCS → 로봇 (이 서버가 호출):
     POST {FAKE_WCS_ROBOT_URL}/api/v1/wcs/transport-orders
+    POST {FAKE_WCS_ROBOT_URL}/api/v1/wcs/transport-orders/{wcsOrderId}/cancel
 테스트 전용:
-    POST /api/test/resume, GET /api/test/state, GET /  (대시보드)
+    POST /api/test/resume, POST /api/test/cancel, GET /api/test/state, GET /  (대시보드)
 """
 from __future__ import annotations
 
@@ -98,6 +101,27 @@ class WcsSimulator:
                 self._dispatch_order()
             stop.wait(ORDER_RETRY_SEC if not should_dispatch or self._robot_reachable is False else 0.5)
 
+    def cancel_current(self) -> tuple[bool, str]:
+        """진행 중 오더의 취소를 로봇에 요청한다 (v07.3 4.8). 대시보드 [취소] 버튼용."""
+        with self._lock:
+            if self._state != "RUNNING" or self._current_order is None:
+                return False, f"취소할 진행 중 오더가 없습니다 (state={self._state})"
+            order_id = self._current_order["wcsOrderId"]
+
+        payload = {"reasonCode": "OPERATOR_REQUEST", "reason": "가짜 WCS 대시보드 수동 취소",
+                   "requestedAt": _now_iso()}
+        code, body = self._post_robot_path(f"/{order_id}/cancel", payload, f"CANCEL-{order_id}")
+        with self._lock:
+            if code in (200, 202) and isinstance(body, dict):
+                status = body.get("orderStatus", "CANCEL_REQUESTED")
+                if self._current_order and self._current_order["wcsOrderId"] == order_id:
+                    self._current_order["orderStatus"] = status
+                self._transition("CANCEL_REQUESTED", f"취소 요청 {order_id} -> 로봇 {status} (HTTP {code})")
+                return True, f"취소 요청 접수 (HTTP {code}, {status})"
+            message = f"취소 요청 실패 HTTP {code}: {body}"
+            log.warning("%s", message)
+            return False, message
+
     def _dispatch_order(self) -> None:
         with self._lock:
             seq = self._order_seq + 1
@@ -134,11 +158,16 @@ class WcsSimulator:
 
     @staticmethod
     def _post_robot(order: dict[str, Any]) -> tuple[int | None, Any]:
-        data = json.dumps(order, ensure_ascii=False).encode("utf-8")
+        return WcsSimulator._post_robot_path("", order, order["wcsOrderId"])
+
+    @staticmethod
+    def _post_robot_path(subpath: str, payload: dict[str, Any],
+                         correlation_id: str) -> tuple[int | None, Any]:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
-            ROBOT_URL + ROBOT_ORDER_PATH, data=data, method="POST",
+            ROBOT_URL + ROBOT_ORDER_PATH + subpath, data=data, method="POST",
             headers={"Content-Type": "application/json; charset=utf-8",
-                     "X-Correlation-Id": order["wcsOrderId"]})
+                     "X-Correlation-Id": correlation_id})
         try:
             with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
                 return response.status, json.loads(response.read().decode("utf-8") or "{}")
@@ -174,6 +203,10 @@ class WcsSimulator:
                 self._current_order["orderStatus"] = "COMPLETED"
                 self._cooldown_until = time.monotonic() + self._cooldown_sec
                 self._transition("COOLDOWN", f"{order_id} 완료, {self._cooldown_sec:.0f}초 대기")
+            elif event_type == "CANCELED":
+                self._current_order["orderStatus"] = "CANCELED"
+                self._cooldown_until = time.monotonic() + self._cooldown_sec
+                self._transition("COOLDOWN", f"{order_id} 취소 완료, {self._cooldown_sec:.0f}초 대기")
             elif event_type == "FAILED":
                 self._current_order["orderStatus"] = "FAILED"
                 self._last_error = {"wcsOrderId": order_id, "message": event.get("message"),
@@ -339,7 +372,7 @@ const PARTS = {
 const deg = r => (r * 180 / Math.PI);
 const f = (v, n=2) => (v === null || v === undefined) ? "—" : Number(v).toFixed(n);
 const ts = s => s ? new Date(s).toLocaleTimeString('ko-KR') : "—";
-const STATE_CLS = {READY:"info", RUNNING:"ok", COOLDOWN:"warn", HALTED:"bad"};
+const STATE_CLS = {READY:"info", RUNNING:"ok", COOLDOWN:"warn", CANCEL_REQUESTED:"warn", HALTED:"bad"};
 const boolTile = (k, on, invert=false) => {
   const good = invert ? !on : on;
   return `<div class="tile"><div class="k">${k}</div>
@@ -348,6 +381,13 @@ const boolTile = (k, on, invert=false) => {
 
 async function resume() {
   await fetch("/api/test/resume", {method:"POST"});
+  tick();
+}
+
+async function cancelOrder() {
+  const r = await fetch("/api/test/cancel", {method:"POST"});
+  const b = await r.json();
+  if (!b.ok) alert(b.message);
   tick();
 }
 
@@ -387,7 +427,8 @@ async function tick() {
 
   const o = s.currentOrder;
   document.getElementById("server").innerHTML =
-    `<div class="big ${STATE_CLS[s.serverState] || ''}">${s.serverState}</div>
+    `<div class="big ${STATE_CLS[s.serverState] || ''}">${s.serverState}${
+       s.serverState === 'RUNNING' ? '<button onclick="cancelOrder()">현재 오더 취소</button>' : ''}</div>
      <div class="row"><span class="k">로봇 오더 서버</span><span class="v ${s.robotReachable===false?'bad':s.robotReachable?'ok':'dim'}">${s.robotUrl}</span></div>
      <div class="row"><span class="k">현재 오더</span><span class="v">${o ? o.wcsOrderId : "—"}</span></div>
      <div class="row"><span class="k">from → to</span><span class="v">${o ? `${o.fromStationId} → ${o.toStationId}` : "—"}</span></div>
@@ -492,6 +533,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/test/resume":
             SIM.resume()
             return self._json(200, {"ok": True, "serverState": SIM.dashboard_state()["serverState"]})
+
+        if path == "/api/test/cancel":
+            ok, message = SIM.cancel_current()
+            return self._json(200 if ok else 409,
+                              {"ok": ok, "message": message,
+                               "serverState": SIM.dashboard_state()["serverState"]})
 
         if path == EVENT_PATH or path == STATUS_PREFIX or path.startswith(STATUS_PREFIX + "/"):
             length = int(self.headers.get("Content-Length") or 0)

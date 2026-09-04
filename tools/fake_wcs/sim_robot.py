@@ -6,6 +6,7 @@
 
 데모(demo_full_sequence_loop.py)와 같은 통신 모듈(communication.wcs)을 그대로 쓴다:
 IDLE(하트비트) → WCS 반송 오더 수신(POST :5225) → WORKING(work-sec) → DONE + COMPLETED 콜백 → IDLE … 반복.
+WORKING 중 취소(POST .../{wcsOrderId}/cancel)가 오면 중단하고 CANCELED 콜백을 보낸다.
 """
 from __future__ import annotations
 
@@ -85,7 +86,21 @@ def main() -> int:
             log.info("사이클 %d 시작: %s (%s -> %s)", cycle, order["wcsOrderId"],
                      order.get("fromStationId"), order.get("toStationId"))
             publisher.set_work_state("WORKING")
-            time.sleep(args.work_sec)
+            # 데모의 단계 경계 취소 확인을 흉내내 0.2초 간격으로 취소 요청을 확인한다.
+            canceled = False
+            work_end = time.monotonic() + args.work_sec
+            while time.monotonic() < work_end:
+                if publisher.cancel_requested() is not None:
+                    canceled = True
+                    break
+                time.sleep(0.2)
+            if canceled:
+                log.info("사이클 %d 취소됨 (WCS 취소 요청)", cycle)
+                publisher.set_work_state("IDLE")
+                publisher.report_canceled()
+                cycle += 1
+                time.sleep(1.0)
+                continue
             if args.error:
                 raise RuntimeError(args.error)
             publisher.set_work_state("DONE")

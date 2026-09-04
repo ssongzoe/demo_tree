@@ -13,6 +13,21 @@ WCS가 로봇 측으로 오더를 POST하고, 로봇은 즉시 ACCEPTED로 응�
        409 DUPLICATE_ORDER_CONFLICT 동일 wcsOrderId·다른 내용
        400 INVALID_REQUEST wcsOrderId 누락 또는 JSON 형식 오류
              (carrierId/fromStationId/toStationId/priority/timestamp는 참조용이라 없어도 접수한다)
+
+취소 (v07.3 4.8 준용):
+
+    POST {ROBOT_ORDER_PATH}/{wcsOrderId}/cancel
+    { "reasonCode": "OPERATOR_REQUEST", "reason": "운영자 수동 취소",
+      "requestedAt": "2026-09-04T09:00:00.000Z" }
+    -> 202 CANCEL_REQUESTED  신규 취소 접수 (접수일 뿐 정지 완료 아님 — CANCELED 콜백으로 종료)
+       200 이미 CANCEL_REQUESTED/CANCELED (현재 상태 반환, 멱등)
+       409 ORDER_ALREADY_FINALIZED 이미 COMPLETED/FAILED
+       404 ORDER_NOT_FOUND
+       400 INVALID_REQUEST reasonCode/requestedAt 누락 또는 알 수 없는 reasonCode
+
+    - 대기 중(ACCEPTED) 오더: 큐에서 제거하고 즉시 CANCELED 콜백 (on_queued_cancel 훅)
+    - 진행 중(IN_PROGRESS) 오더: 취소 플래그만 세움. 작업 실행부가 다음 안전 지점(단계 경계)에서
+      정지한 뒤 CANCELED 콜백을 보낸다.
 """
 
 from __future__ import annotations
@@ -23,8 +38,8 @@ import threading
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Callable
+from urllib.parse import unquote, urlparse
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +50,11 @@ REQUIRED_FIELDS = ("wcsOrderId",)
 # 멱등 판정에 쓰는 필드. timestamp는 재전송마다 달라질 수 있으므로 제외한다.
 COMPARE_FIELDS = ("carrierId", "fromStationId", "toStationId", "priority")
 
+# 취소 요청 (v07.3 4.8)
+CANCEL_REASON_CODES = ("OPERATOR_REQUEST", "SYSTEM_ERROR", "TIMEOUT", "OTHER")
+CANCEL_REQUIRED_FIELDS = ("reasonCode", "requestedAt")
+FINAL_STATUSES = ("COMPLETED", "FAILED")
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -43,10 +63,14 @@ def _now_iso() -> str:
 class OrderReceiver:
     """오더를 받아 큐에 쌓고, 데모 루프가 wait_for_order()로 하나씩 꺼내 간다."""
 
-    def __init__(self, bind: str, port: int, order_path: str) -> None:
+    def __init__(self, bind: str, port: int, order_path: str,
+                 on_queued_cancel: Callable[[str, dict[str, Any]], None] | None = None) -> None:
         self._bind = bind
         self._port = port
         self._order_path = "/" + order_path.strip("/")
+        # 대기 중(아직 시작 전) 오더가 취소됐을 때 호출된다: (wcsOrderId, cancel_info).
+        # 진행 중 오더의 취소는 작업 실행부가 cancel_requested()로 확인한다.
+        self._on_queued_cancel = on_queued_cancel
         self._lock = threading.Lock()
         self._arrived = threading.Condition(self._lock)
         self._orders: dict[str, dict[str, Any]] = {}
@@ -62,15 +86,22 @@ class OrderReceiver:
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
-                if urlparse(self.path).path != receiver._order_path:
+                path = urlparse(self.path).path
+                cancel_order_id = receiver._parse_cancel_path(path)
+                if path != receiver._order_path and cancel_order_id is None:
                     return self._json(404, {"errorCode": "NOT_FOUND", "path": self.path})
+
                 length = int(self.headers.get("Content-Length") or 0)
                 try:
                     body = json.loads(self.rfile.read(length).decode("utf-8"))
                 except (ValueError, UnicodeDecodeError) as error:
                     return self._json(400, {"errorCode": "INVALID_REQUEST",
                                             "message": f"invalid JSON: {error}", "timestamp": _now_iso()})
-                code, response = receiver.submit(body)
+
+                if cancel_order_id is not None:
+                    code, response = receiver.submit_cancel(cancel_order_id, body)
+                else:
+                    code, response = receiver.submit(body)
                 self._json(code, response)
 
             def do_GET(self):  # noqa: N802
@@ -144,6 +175,73 @@ class OrderReceiver:
         log.info("반송 오더 수신: %s (%s -> %s, carrier=%s)", order_id,
                  body.get("fromStationId"), body.get("toStationId"), body.get("carrierId"))
         return 201, self._accept_body(order_id, "ACCEPTED")
+
+    def submit_cancel(self, order_id: str, body: Any) -> tuple[int, dict[str, Any]]:
+        """취소 요청 처리 (v07.3 4.8). (status code, response body)를 돌려준다."""
+        if not isinstance(body, dict):
+            return 400, {"errorCode": "INVALID_REQUEST", "message": "body must be an object",
+                         "timestamp": _now_iso()}
+        missing = [field for field in CANCEL_REQUIRED_FIELDS if not body.get(field)]
+        if missing:
+            return 400, {"errorCode": "INVALID_REQUEST", "message": f"missing fields: {', '.join(missing)}",
+                         "timestamp": _now_iso()}
+        reason_code = str(body["reasonCode"]).strip().upper()
+        if reason_code not in CANCEL_REASON_CODES:
+            return 400, {"errorCode": "INVALID_REQUEST",
+                         "message": f"unknown reasonCode: {reason_code} "
+                                    f"(expected one of {', '.join(CANCEL_REASON_CODES)})",
+                         "timestamp": _now_iso()}
+
+        cancel_info = {"reasonCode": reason_code, "reason": body.get("reason"),
+                       "requestedAt": body.get("requestedAt")}
+        queued_cancel = False
+        with self._lock:
+            record = self._orders.get(order_id)
+            if record is None:
+                return 404, {"errorCode": "ORDER_NOT_FOUND",
+                             "message": f"unknown wcsOrderId: {order_id}", "timestamp": _now_iso()}
+            status = record["status"]
+            if status in ("CANCEL_REQUESTED", "CANCELED"):
+                log.info("중복 취소 요청 (멱등 처리): %s -> %s", order_id, status)
+                return 200, self._accept_body(order_id, status)
+            if status in FINAL_STATUSES:
+                log.warning("이미 종료된 오더에 취소 요청: %s (%s)", order_id, status)
+                return 409, {"errorCode": "ORDER_ALREADY_FINALIZED",
+                             "message": f"order already {status}", "timestamp": _now_iso()}
+
+            record["cancel"] = cancel_info
+            record["status"] = "CANCEL_REQUESTED"
+            if record in self._queue:  # 아직 시작 전(ACCEPTED) — 큐에서 빼고 즉시 취소 처리
+                self._queue.remove(record)
+                queued_cancel = True
+
+        log.info("취소 요청 접수: %s (reasonCode=%s, %s)", order_id, reason_code,
+                 "대기 중 오더 즉시 취소" if queued_cancel else "진행 중 → 안전 정지 후 CANCELED 콜백")
+        if queued_cancel and self._on_queued_cancel is not None:
+            try:
+                self._on_queued_cancel(order_id, cancel_info)
+            except Exception:  # noqa: BLE001 - 콜백 실패로 HTTP 응답을 막지 않는다.
+                log.exception("대기 오더 취소 콜백 처리 실패: %s", order_id)
+        return 202, self._accept_body(order_id, "CANCEL_REQUESTED")
+
+    def cancel_requested(self, order_id: str) -> dict[str, Any] | None:
+        """해당 오더에 취소 요청이 걸려 있으면 취소 정보를 돌려준다."""
+        with self._lock:
+            record = self._orders.get(order_id)
+            if record is not None and record["status"] == "CANCEL_REQUESTED":
+                return dict(record.get("cancel") or {})
+            return None
+
+    def _parse_cancel_path(self, path: str) -> str | None:
+        """`{order_path}/{wcsOrderId}/cancel` 형태면 wcsOrderId를 돌려준다."""
+        prefix = self._order_path + "/"
+        suffix = "/cancel"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        middle = path[len(prefix):-len(suffix)]
+        if not middle or "/" in middle:
+            return None
+        return unquote(middle)
 
     def wait_for_order(self, timeout: float | None = None,
                        stop_event: threading.Event | None = None) -> dict[str, Any] | None:

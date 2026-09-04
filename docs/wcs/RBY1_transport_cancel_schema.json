@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "RBY1_transport_cancel_schema.json",
+  "title": "RB-Y1 반송 오더 취소 (WCS → RB-Y1)",
+  "description": "SFA WCS가 진행 중인 반송 오더를 취소하는 요청 body. SFA-WCS 규격서 v07.3 '4.8 Transport Order 취소 API'를 RB-Y1에 맞게 적용한 것입니다. 전송: POST http://{RB-Y1_HOST}:5225/api/v1/wcs/transport-orders/{wcsOrderId}/cancel, Content-Type: application/json; charset=utf-8, 헤더 X-Correlation-Id: CANCEL-{wcsOrderId} 권장. wcsOrderId는 URL Path로만 지정하며 body에는 넣지 않습니다.",
+  "type": "object",
+  "required": ["reasonCode", "requestedAt"],
+  "additionalProperties": false,
+  "properties": {
+    "reasonCode": {
+      "type": "string",
+      "enum": ["OPERATOR_REQUEST", "SYSTEM_ERROR", "TIMEOUT", "OTHER"],
+      "description": "취소 사유 코드 (규격서 4.8과 동일).",
+      "examples": ["OPERATOR_REQUEST"]
+    },
+    "reason": {
+      "type": ["string", "null"],
+      "description": "운영자 또는 시스템이 기록하는 상세 취소 사유. 선택.",
+      "examples": ["운영자 수동 취소"]
+    },
+    "requestedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "WCS 취소 요청 시각. ISO 8601.",
+      "examples": ["2026-09-04T09:00:00.000Z"]
+    }
+  },
+  "definitions": {
+    "acceptedResponse": {
+      "type": "object",
+      "title": "정상 응답 (HTTP 202 신규 취소 접수 / HTTP 200 중복 취소)",
+      "description": "202는 취소 요청 접수만 의미하며 정지 완료가 아닙니다. RB-Y1이 안전 정지를 마치면 transport-events 콜백으로 eventType=CANCELED, result=SUCCESS 를 전송하고, WCS는 그 시점에 오더를 CANCELED로 종료합니다. 이미 CANCEL_REQUESTED/CANCELED인 오더에 재요청하면 200과 현재 상태를 반환하며 정지 작업을 중복 수행하지 않습니다.",
+      "required": ["wcsOrderId", "orderStatus", "timestamp"],
+      "properties": {
+        "wcsOrderId": { "type": "string", "examples": ["WCS-20260904-000001"] },
+        "orderStatus": {
+          "type": "string",
+          "enum": ["CANCEL_REQUESTED", "CANCELED"],
+          "examples": ["CANCEL_REQUESTED"]
+        },
+        "timestamp": { "type": "string", "format": "date-time", "examples": ["2026-09-04T09:00:00.150Z"] }
+      }
+    },
+    "errorResponse": {
+      "type": "object",
+      "title": "오류 응답 (HTTP 400 / 404 / 409)",
+      "required": ["errorCode", "message", "timestamp"],
+      "properties": {
+        "errorCode": {
+          "type": "string",
+          "enum": ["INVALID_REQUEST", "ORDER_NOT_FOUND", "ORDER_ALREADY_FINALIZED"],
+          "description": "INVALID_REQUEST(400): reasonCode/requestedAt 누락 또는 알 수 없는 reasonCode. ORDER_NOT_FOUND(404): 해당 wcsOrderId 없음. ORDER_ALREADY_FINALIZED(409): 이미 COMPLETED/FAILED로 종료된 오더."
+        },
+        "message": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "x-behavior": {
+    "queuedOrder": "아직 시작 전(ACCEPTED, 대기열)인 오더를 취소하면 202 응답 후 정지할 작업이 없으므로 즉시 CANCELED 콜백을 전송합니다.",
+    "inProgressOrder": "진행 중(IN_PROGRESS)인 오더는 202 응답 후 RB-Y1이 모션 도중이 아닌 다음 단계 경계(안전 지점: 파지 전/이송 전/AR 정렬 전/배치 전/복귀 전)에서 정지하고 CANCELED 콜백을 전송합니다. 취소 시점에 따라 토트를 든 채 정지할 수 있으며, 규격서 4.8과 동일하게 화물·설비 복구는 운영자가 수행합니다.",
+    "idempotency": "동일 wcsOrderId의 취소 요청을 반복 수신해도 정지 작업을 중복 수행하지 않고 현재 상태를 반환합니다 (200).",
+    "cancelFailure": "체크포인트 정지 방식이라 별도의 취소 실패 경로는 없습니다. 정지 과정에서 로봇 오류가 발생하면 기존과 동일하게 eventType=FAILED(+message)로 보고됩니다. ※ 규격서 4.8의 result=FAILURE 표기는 10장 콜백(SUCCESS/FAILED)과 상이하여, RB-Y1은 10장 기준(FAILED)으로 통일했습니다. 협의 필요 시 말씀 부탁드립니다."
+  }
+}

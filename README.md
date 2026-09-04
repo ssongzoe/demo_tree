@@ -93,6 +93,8 @@ curl -X POST localhost:5225/api/v1/wcs/transport-orders -H 'Content-Type: applic
   로봇: IDLE → WORKING → (사이클) → DONE, COMPLETED 콜백 → IDLE
   서버: COMPLETED 수신 ─ COOLDOWN 15초 ─ READY ─ 다음 오더 POST … 반복
   로봇 FAILED 콜백(message 포함) ─ HALTED (발행 중단, 에러 표시) ─ [재개] ─ READY
+  대시보드 [현재 오더 취소] ─ 로봇에 취소 POST(202) ─ CANCEL_REQUESTED ─ 로봇이 단계 경계에서
+  정지 후 CANCELED 콜백 ─ COOLDOWN ─ 다음 오더
 ```
 
 ## 통신 규격 (테스트용 최소, AMR v07.2 축소판)
@@ -100,7 +102,8 @@ curl -X POST localhost:5225/api/v1/wcs/transport-orders -H 'Content-Type: applic
 | 방향 | 메서드/경로 | 내용 |
 |---|---|---|
 | WCS→로봇 | `POST /api/v1/wcs/transport-orders` | `{wcsOrderId, carrierId, fromStationId, toStationId, priority, timestamp}` → 201 `{wcsOrderId, orderStatus:"ACCEPTED", timestamp}`. 동일 ID 재전송 200(멱등), 내용 다르면 409 `DUPLICATE_ORDER_CONFLICT`, 필수값 누락 400 |
-| 로봇→WCS | `POST /api/v1/rb/transport-events` | `{eventId, wcsOrderId, eventType: COMPLETED\|FAILED, robotSerial, result, message, occurredAt}` → `{accepted:true, eventId, receivedAt}`. eventId로 멱등, 로봇은 3회 재시도 |
+| WCS→로봇 | `POST /api/v1/wcs/transport-orders/{wcsOrderId}/cancel` | `{reasonCode, reason?, requestedAt}` → 202 `CANCEL_REQUESTED`(접수) 후 로봇이 단계 경계에서 안전 정지하고 `CANCELED` 콜백. 중복 200, 미존재 404, 이미 종료 409 (v07.3 4.8 준용) |
+| 로봇→WCS | `POST /api/v1/rb/transport-events` | `{eventId, wcsOrderId, eventType: COMPLETED\|FAILED\|CANCELED, robotSerial, result, message, occurredAt}` → `{accepted:true, eventId, receivedAt}`. eventId로 멱등, 실패 시 큐에 보관 후 재시도 |
 | 로봇→WCS | `POST /api/v1/rb/rby1/status` | 기존 status payload 1Hz → 201 `{"accepted":true}` |
 | 로봇→WCS | `GET /health` | `healthy` |
 | 조회 | `GET /api/v1/rb/rby1/status/{serial}/latest`, `…/history?limit=N` | 실 WCS와 같은 평탄화 레코드 + `errorMessage` 컬럼 |

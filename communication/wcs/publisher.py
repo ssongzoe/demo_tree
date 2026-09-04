@@ -20,8 +20,12 @@ log = logging.getLogger(__name__)
 
 # WCS 연결이 끊긴 동안 로봇에 쌓아 두는 최대 건수. 넘치면 가장 오래된 것부터 버린다.
 # (로봇 상태 스냅샷은 최신 1건만 유지하므로 여기에 쌓이지 않는다.)
-PENDING_EVENT_MAXLEN = 10   # 미전송 transport-event (COMPLETED/FAILED)
+PENDING_EVENT_MAXLEN = 10   # 미전송 transport-event (COMPLETED/FAILED/CANCELED)
 WORK_EVENT_MAXLEN = 10      # 미전송 work_cycle 전환
+
+
+class OrderCanceled(RuntimeError):
+    """WCS가 현재 진행 중인 오더의 취소를 요청했다. 작업 실행부가 안전 지점에서 raise한다."""
 
 
 class WcsPublisher:
@@ -53,7 +57,8 @@ class WcsPublisher:
         )
         # WCS → 로봇 반송 오더 수신 (AMR Transport Order 규격 준용). DRY_RUN이면 띄우지 않는다.
         self._order_receiver = OrderReceiver(config.ROBOT_ORDER_BIND, config.ROBOT_ORDER_PORT,
-                                             config.ROBOT_ORDER_PATH)
+                                             config.ROBOT_ORDER_PATH,
+                                             on_queued_cancel=self._on_queued_cancel)
         self._current_order: dict[str, Any] | None = None
         self._dry_run_order_seq = 0
         # 전송 실패한 transport-event. 전송 스레드가 매 주기 재시도한다(서버가 열리면 즉시 전송).
@@ -210,13 +215,40 @@ class WcsPublisher:
         """현재 오더를 FAILED로 WCS에 보고한다. 진행 중인 오더가 없으면 아무것도 하지 않는다."""
         return self._report_order_event("FAILED", "FAILED", message)
 
+    # ── 취소 (v07.3 4.8 준용) ───────────────────────────────────────────────
+    def cancel_requested(self) -> dict[str, Any] | None:
+        """현재 오더에 WCS 취소 요청이 걸려 있으면 취소 정보(reasonCode 등)를 돌려준다."""
+        order = self._current_order
+        if order is None or self._dry_run:
+            return None
+        return self._order_receiver.cancel_requested(str(order["wcsOrderId"]))
+
+    def raise_if_cancel_requested(self) -> None:
+        """작업 실행부가 단계 경계(안전 지점)마다 호출한다. 취소 요청이 있으면 OrderCanceled."""
+        cancel = self.cancel_requested()
+        if cancel is not None:
+            raise OrderCanceled(cancel.get("reasonCode") or "CANCEL")
+
+    def report_canceled(self) -> bool:
+        """안전 정지 완료 후 현재 오더를 CANCELED로 WCS에 보고한다."""
+        return self._report_order_event("CANCELED", "SUCCESS", None)
+
+    def _on_queued_cancel(self, order_id: str, cancel_info: dict[str, Any]) -> None:
+        """아직 시작 전인 오더가 취소됐다. 정지할 작업이 없으므로 즉시 CANCELED를 보고한다."""
+        log.info("대기 중 오더 취소 -> 즉시 CANCELED 보고: %s (reasonCode=%s)",
+                 order_id, cancel_info.get("reasonCode"))
+        self._send_event(order_id, "CANCELED", "SUCCESS", None)
+
     def _report_order_event(self, event_type: str, result: str, message: str | None) -> bool:
         order = self._current_order
         if order is None:
             log.debug("보고할 진행 중 오더가 없습니다 (%s)", event_type)
             return False
 
-        order_id = str(order["wcsOrderId"])
+        self._current_order = None
+        return self._send_event(str(order["wcsOrderId"]), event_type, result, message)
+
+    def _send_event(self, order_id: str, event_type: str, result: str, message: str | None) -> bool:
         body = {
             "eventId": uuid.uuid4().hex,
             "wcsOrderId": order_id,
@@ -228,7 +260,6 @@ class WcsPublisher:
         }
 
         self._order_receiver.set_status(order_id, event_type)
-        self._current_order = None
 
         # 실패해도 데모를 막지 않는다. eventId를 유지한 채 큐에 넣어두면
         # 전송 스레드가 매 주기 재시도하므로 WCS가 열리는 즉시 전송된다(중복은 eventId로 멱등).
