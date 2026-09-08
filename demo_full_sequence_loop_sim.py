@@ -30,15 +30,15 @@ from communication.wcs.publisher import OrderCanceled, WcsPublisher
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_head
-from skills.ar_align import ARAligner
-from skills.tote_align import ToteAligner
+# from skills.ar_align import ARAligner
+# from skills.tote_align import ToteAligner
 from utils.ar_marker import RealSenseCamera
 
 # -----------------------------------------------------------------------------
 # 로봇 / 카메라 설정
 # -----------------------------------------------------------------------------
 
-ADDRESS = "192.168.30.1:50051"
+ADDRESS = "127.0.0.1:50051"
 
 HEAD_CAMERA_SERIAL = "250122079439"
 MARKER_ID = 8
@@ -64,24 +64,24 @@ INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 BEFORE_RIGHT = np.deg2rad([-38.23, -53.19, -21.31, -48.14, -63.73, 81.18, 2.39]).tolist()
 BEFORE_LEFT = np.deg2rad([-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]).tolist()
 
-# GRASP_RIGHT = np.deg2rad([-37.43, -32.30, -21.34, -49.22, -63.95, 81.79, 2.40]).tolist()
-# GRASP_LEFT = np.deg2rad([-37.43, 32.30, 21.34, -49.22, 63.95, 81.79, -2.40]).tolist()
+GRASP_RIGHT = np.deg2rad([-43.07, -27.97, -23.04, -42.20, -56.59, 78.86, 3.54]).tolist()
+GRASP_LEFT = np.deg2rad([-43.07, 27.97, 23.04, -42.20, 56.59, 78.86, -3.54]).tolist()
 
-
-GRASP_RIGHT = np.deg2rad([-42.62, -27.96, -23.02, -44.12, -56.52, 79.75, 2.29]).tolist()
-GRASP_LEFT = np.deg2rad([-42.09, 35.99, 24.71, -35.13, 61.30, 80.48, 3.05]).tolist()
-
-UP_RIGHT = np.deg2rad([-51.484, -34.150, -23.371, -61.041, -58.417, 97.745, -19.417]).tolist()
-UP_LEFT = np.deg2rad([-51.484, 34.150, 23.371, -61.041, 58.417, 97.745, 19.417]).tolist()
+UP_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
+UP_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
 
 PULL_RIGHT = np.deg2rad([-4.50, -28.21, -33.62, -106.81, -74.26, 99.28, -19.51]).tolist()
 PULL_LEFT = np.deg2rad([-4.50, 28.21, 33.62, -106.81, 74.26, 99.28, 19.52]).tolist()
 
-DOWN_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
-DOWN_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
-
 STRETCH_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
 STRETCH_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
+
+# DOWN_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
+# DOWN_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
+
+DOWN_RIGHT = np.deg2rad([-43.07, -27.97, -23.04, -42.20, -56.59, 78.86, 3.54]).tolist()
+DOWN_LEFT = np.deg2rad([-43.07, 27.97, 23.04, -42.20, 56.59, 78.86, -3.54]).tolist()
+
 
 AFTER_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
 AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
@@ -102,36 +102,13 @@ ARM_UP_MOVE_TIME = 2.0
 # 아래 target 값만 수정하면 실제 실행 로그도 현재 값에 맞춰 자동으로 바뀐다.
 # -----------------------------------------------------------------------------
 
-BACK_TARGET = (-0.10, 0.0, 0.0)
-# yaw 부호가 회전 방향이다. + 는 +z(반시계), - 는 -z(시계) 회전.
-TURN_TARGET = (-0.05, -0.05, math.radians(+180.43))
-STRAIGHT_TARGET = (0.65, 0.0, 0.0)
-
-RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
-RETURN_TURN_TARGET = (0.0, 0.0, math.radians(183.43))
-RETURN_STRAIGHT_TARGET = (1.00, 0.0, 0.0)
-
-# Beautiful Spiral Turn 만들기 
-def compose_relative_targets(*targets):
-    """여러 body-frame 상대 target을 하나의 최종 상대 target으로 합성한다."""
-    x_m = 0.0
-    y_m = 0.0
-    yaw_rad = 0.0
-
-    for dx_m, dy_m, dyaw_rad in targets:
-        cosine = math.cos(yaw_rad)
-        sine = math.sin(yaw_rad)
-        x_m += cosine * dx_m - sine * dy_m
-        y_m += sine * dx_m + cosine * dy_m
-        yaw_rad += dyaw_rad
-
-    return x_m, y_m, yaw_rad
-
-OUTBOUND_DIRECT_TARGET = compose_relative_targets(BACK_TARGET, TURN_TARGET, STRAIGHT_TARGET)
+OUTBOUND_DIRECT_TARGET = (-0.80, 0.80, math.radians(+181.85))
 OUTBOUND_DIRECT_DURATION = 8.0 # 가는거 8초
 OUTBOUND_HEAD_DELAY = 3.0
 
-RETURN_TURN_AND_STRAIGHT_TARGET = compose_relative_targets(RETURN_TURN_TARGET, RETURN_STRAIGHT_TARGET)
+RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
+
+RETURN_TURN_AND_STRAIGHT_TARGET = (0.60, 0.3, math.radians(-183.43))
 RETURN_TURN_AND_STRAIGHT_DURATION = 9.0 #오는거 9초
 
 # ------------------------------------------------------------------
@@ -251,17 +228,17 @@ def detect_grasp_and_lift(
     robot,
     monitor,
     gripper,
-    tote_aligner: ToteAligner,
+    # tote_aligner: ToteAligner,
     gripper_target: float,
     gripper_torque: float,
 ) -> bool:
     """Tote를 정렬한 뒤 양팔을 BEFORE → GRASP → UP 순서로 이동해 파지한다."""
 
 
-    print("[1/5] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
-    if not tote_aligner.align(robot, monitor, verify=True):
-        print("Tote one-shot 정렬 실패")
-        return False
+    # print("[1/5] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
+    # if not tote_aligner.align(robot, monitor, verify=True):
+    #     print("Tote one-shot 정렬 실패")
+    #     return False
 
     print("[2/5] 현재 자세 → BEFORE")
     if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.0):
@@ -273,9 +250,9 @@ def detect_grasp_and_lift(
         print("GRASP 자세 이동 실패")
         return False
 
-    print(f"그리퍼 닫기: target={gripper_target:.2f}, torque={gripper_torque:.2f} Nm")
-    gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
-    print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
+    # print(f"그리퍼 닫기: target={gripper_target:.2f}, torque={gripper_torque:.2f} Nm")
+    # gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
+    # print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
 
     print("[4/5] GRASP → UP")
     if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.2):
@@ -312,7 +289,7 @@ def run_turn_and_go(robot, monitor) -> bool:
             OUTBOUND_DIRECT_TARGET,
             OUTBOUND_DIRECT_DURATION,
             True,
-            0.2,
+            2.0,
         )
         head_ok = wait_for_head_move(head_move, "Head 정면 자세 이동")
         head_move = None
@@ -337,8 +314,8 @@ def lower_release_and_retract(robot, gripper) -> bool:
         print("DOWN 자세 이동 실패")
         return False
 
-    print("그리퍼 열기")
-    gripper.open(duration=1.0)
+    # print("그리퍼 열기")
+    # gripper.open(duration=1.0)
 
     print("DOWN → AFTER")
     if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=1.0):
@@ -414,7 +391,7 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
         robot,
         monitor,
         gripper,
-        tote_aligner=tote_aligner,
+        # tote_aligner=tote_aligner,
         gripper_target=args.gripper_target,
         gripper_torque=args.gripper_torque,
     ):
@@ -425,10 +402,10 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
     if not run_turn_and_go(robot, monitor):
         raise RuntimeError("이송 direct target 주행 실패")
 
-    check_cancel()  # AR 정렬 전
-    print("AR 마커 one-shot 정렬")
-    if not ar_aligner.align(robot, monitor):
-        raise RuntimeError("AR 마커 정렬 실패")
+    # check_cancel()  # AR 정렬 전
+    # print("AR 마커 one-shot 정렬")
+    # if not ar_aligner.align(robot, monitor):
+    #     raise RuntimeError("AR 마커 정렬 실패")
 
     check_cancel()  # 배치 전
     if not lower_release_and_retract(robot, gripper):
@@ -465,11 +442,13 @@ def main() -> None:
     args = parser.parse_args()
 
     robot = initialize_mobile(args.address, args.model, power=".*", servo=".*", unlimited=False)
-
     gripper = None
-    head_camera = RealSenseCamera(HEAD_CAM_WIDTH, HEAD_CAM_HEIGHT, HEAD_CAM_FPS, serial=args.camera_serial)
-    tote_aligner = ToteAligner(camera=head_camera, show=args.show_tote)
-    ar_aligner = ARAligner(marker_id=args.marker_id, camera=head_camera)
+    head_camera = None
+    # head_camera = RealSenseCamera(HEAD_CAM_WIDTH, HEAD_CAM_HEIGHT, HEAD_CAM_FPS, serial=args.camera_serial)
+    tote_aligner = None
+    ar_aligner = None
+    # tote_aligner = ToteAligner(camera=head_camera, show=args.show_tote)
+    # ar_aligner = ARAligner(marker_id=args.marker_id, camera=head_camera)
     monitor = OdometryMonitor()
     wcs_publisher = WcsPublisher(robot_model=robot.model())
     state_update_started = False
@@ -487,9 +466,9 @@ def main() -> None:
         robot.set_tool_flange_output_voltage("left", 12)
         time.sleep(0.5)
 
-        gripper = GripperController(position_torque=args.gripper_torque)
-        gripper.connect()
-        gripper.open(duration=2.0)
+        # gripper = GripperController(position_torque=args.gripper_torque)
+        # gripper.connect()
+        # gripper.open(duration=2.0)
 
         # SDK state 구독은 한 번만 시작하고, 같은 state를 오도메트리와 WCS 상태 저장부에 함께 전달한다.
         def on_robot_state(state, *callback_args):
@@ -504,6 +483,11 @@ def main() -> None:
 
         # 초기에는 Tote 시야를 위한 Torso / Head만 기준 자세로 맞춘다. 양팔 BEFORE 이동은 Tote 정렬 후에 수행한다.
         initial_head_move = move_head_async(robot, HEAD_DOWN, "초기 Torso / Head 기준 자세로 이동")
+        initial_arm_move = move_arms_async(robot, BEFORE_RIGHT, BEFORE_LEFT, "초기 양팔 BEFORE 자세로 이동")
+
+        if not wait_for_arm_move(initial_arm_move, "초기 양팔 BEFORE 자세 이동"):
+            raise RuntimeError("초기 양팔 BEFORE 자세 이동 실패")
+
         if not wait_for_head_move(initial_head_move, "초기 Torso / Head 자세 이동"):
             raise RuntimeError("초기 Torso / Head 자세 이동 실패")
 
@@ -511,8 +495,8 @@ def main() -> None:
             f"Head 공용 카메라 시작: serial={args.camera_serial}, "
             f"{HEAD_CAM_WIDTH}x{HEAD_CAM_HEIGHT}@{HEAD_CAM_FPS}"
         )
-        head_camera.start()
-        head_camera_started = True
+        # head_camera.start()
+        # head_camera_started = True
 
         cycle_index = 1
 
@@ -577,8 +561,8 @@ def main() -> None:
             except Exception:
                 pass
 
-        if gripper is not None:
-            gripper.disconnect()
+        # if gripper is not None:
+        #     gripper.disconnect()
 
         try:
             robot.set_tool_flange_output_voltage("right", 0)

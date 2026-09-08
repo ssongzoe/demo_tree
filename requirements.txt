@@ -1,0 +1,9 @@
+certifi==2026.7.22
+charset-normalizer==3.5.1
+idna==3.19
+numpy==2.5.3
+opencv-python==5.0.0.93
+pyrealsense2==2.58.4.10922
+rby1-sdk==0.10.0
+requests==2.34.2
+urllib3==2.7.0
