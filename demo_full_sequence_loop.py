@@ -3,7 +3,7 @@
 동작 순서
 0. torso / head를 calibration 기준 자세로 먼저 맞춘 뒤, main에서 Head RealSense pipeline을 한 번만 시작해 Tote/AR가 함께 사용
 1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
-2. Tote 정렬 후 양팔을 BEFORE → GRASP로 이동한 뒤 그리퍼를 닫고 UP 자세로 들어 올림
+2. Tote 정렬 후 BEFORE → GRASP로 파지하고, UP 근처를 통과해 PULL까지 J자 경로로 연속 이동
 3. BACK + TURN + STRAIGHT를 합성한 direct target으로 이송하며 후반에 Head를 정면 자세로 전환
 4. AR 마커 기준으로 배치 위치 정렬
 5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE 자세로 후퇴
@@ -29,7 +29,7 @@ import numpy as np
 from communication.wcs.publisher import OrderCanceled, WcsPublisher
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
-from control.robot_controller import move_both_arms, move_torso_and_head
+from control.robot_controller import move_both_arms, move_torso_and_arms_through_waypoint, move_torso_and_head
 from skills.ar_align import ARAligner
 from skills.tote_align import ToteAligner
 from utils.ar_marker import RealSenseCamera
@@ -57,22 +57,19 @@ INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 
 # -----------------------------------------------------------------------------
 # Tote 파지 자세
-# torso는 BEFORE / GRASP / UP 동안 동일하게 유지하며, 아래 값 하나만 사용한다.
+# GRASP에서는 양팔과 Torso를 동시에 이동하고, 이후 UP → PULL은 하나의 연속 trajectory로 수행한다.
 # -----------------------------------------------------------------------------
-
 
 BEFORE_RIGHT = np.deg2rad([-38.23, -53.19, -21.31, -48.14, -63.73, 81.18, 2.39]).tolist()
 BEFORE_LEFT = np.deg2rad([-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]).tolist()
 
-# GRASP_RIGHT = np.deg2rad([-37.43, -32.30, -21.34, -49.22, -63.95, 81.79, 2.40]).tolist()
-# GRASP_LEFT = np.deg2rad([-37.43, 32.30, 21.34, -49.22, 63.95, 81.79, -2.40]).tolist()
+GRASP_RIGHT = np.deg2rad([-29.44, -25.47, -27.98, -83.08, -60.68, 90.04, -10.97]).tolist()
+GRASP_LEFT = np.deg2rad([-29.45, 25.49, 28.05, -82.82, 60.79, 89.98, 10.78]).tolist()
+GRASP_TORSO = np.deg2rad([0.02, 33.00, -52.01, 40.00, 0.05, 0.01]).tolist()
 
-
-GRASP_RIGHT = np.deg2rad([-42.62, -27.96, -23.02, -44.12, -56.52, 79.75, 2.29]).tolist()
-GRASP_LEFT = np.deg2rad([-42.09, 35.99, 24.71, -35.13, 61.30, 80.48, 3.05]).tolist()
-
-UP_RIGHT = np.deg2rad([-51.484, -34.150, -23.371, -61.041, -58.417, 97.745, -19.417]).tolist()
-UP_LEFT = np.deg2rad([-51.484, 34.150, 23.371, -61.041, 58.417, 97.745, 19.417]).tolist()
+UP_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
+UP_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
+UP_TORSO = INITIAL_TORSO.copy()
 
 PULL_RIGHT = np.deg2rad([-4.50, -28.21, -33.62, -106.81, -74.26, 99.28, -19.51]).tolist()
 PULL_LEFT = np.deg2rad([-4.50, 28.21, 33.62, -106.81, 74.26, 99.28, 19.52]).tolist()
@@ -95,6 +92,12 @@ HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
 HEAD_MOVE_TIME = 2.0
 ARM_UP_MOVE_TIME = 2.0
 
+LIFT_DURATION = 1.2
+PULL_DURATION = 1.2
+# 가드 회피를 위해 UP 경로의 약 98%까지 올라간 뒤 PULL 방향을 겹치기 시작한다.
+LIFT_PULL_OVERLAP = 0.75
+LIFT_PULL_STREAM_RATE_HZ = 100.0
+
 
 # -----------------------------------------------------------------------------
 # 모바일 경로
@@ -102,36 +105,13 @@ ARM_UP_MOVE_TIME = 2.0
 # 아래 target 값만 수정하면 실제 실행 로그도 현재 값에 맞춰 자동으로 바뀐다.
 # -----------------------------------------------------------------------------
 
-BACK_TARGET = (-0.10, 0.0, 0.0)
-# yaw 부호가 회전 방향이다. + 는 +z(반시계), - 는 -z(시계) 회전.
-TURN_TARGET = (-0.05, -0.05, math.radians(+180.43))
-STRAIGHT_TARGET = (0.65, 0.0, 0.0)
-
-RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
-RETURN_TURN_TARGET = (0.0, 0.0, math.radians(183.43))
-RETURN_STRAIGHT_TARGET = (1.00, 0.0, 0.0)
-
-# Beautiful Spiral Turn 만들기 
-def compose_relative_targets(*targets):
-    """여러 body-frame 상대 target을 하나의 최종 상대 target으로 합성한다."""
-    x_m = 0.0
-    y_m = 0.0
-    yaw_rad = 0.0
-
-    for dx_m, dy_m, dyaw_rad in targets:
-        cosine = math.cos(yaw_rad)
-        sine = math.sin(yaw_rad)
-        x_m += cosine * dx_m - sine * dy_m
-        y_m += sine * dx_m + cosine * dy_m
-        yaw_rad += dyaw_rad
-
-    return x_m, y_m, yaw_rad
-
-OUTBOUND_DIRECT_TARGET = compose_relative_targets(BACK_TARGET, TURN_TARGET, STRAIGHT_TARGET)
+OUTBOUND_DIRECT_TARGET = (-0.80, 0.80, math.radians(+181.85))
 OUTBOUND_DIRECT_DURATION = 8.0 # 가는거 8초
 OUTBOUND_HEAD_DELAY = 3.0
 
-RETURN_TURN_AND_STRAIGHT_TARGET = compose_relative_targets(RETURN_TURN_TARGET, RETURN_STRAIGHT_TARGET)
+RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
+
+RETURN_TURN_AND_STRAIGHT_TARGET = (0.60, 0.7, math.radians(-183.43))
 RETURN_TURN_AND_STRAIGHT_DURATION = 9.0 #오는거 9초
 
 # ------------------------------------------------------------------
@@ -160,8 +140,15 @@ def run_mobile_leg(robot, monitor, stream, step: str, target, duration: float, s
     return move_leg(robot, monitor, leg, settle=settle, stream=stream, stop_at_end=stop_at_end)
 
 
-def move_head_async(robot, head_pose, description: str, delay: float = 0.0) -> Future:
-    """Torso 기준을 유지하며 Head 명령을 선택적으로 지연해 주행과 겹친다."""
+def move_torso_and_head_async(
+    robot,
+    torso_pose,
+    head_pose,
+    description: str,
+    minimum_time: float,
+    delay: float = 0.0,
+) -> Future:
+    """별도 thread에서 Torso / Head 명령을 실행한다."""
     future = Future()
 
     def worker():
@@ -172,14 +159,26 @@ def move_head_async(robot, head_pose, description: str, delay: float = 0.0) -> F
             if not future.set_running_or_notify_cancel():
                 return
 
-            success = move_torso_and_head(robot, INITIAL_TORSO, head_pose, minimum_time=HEAD_MOVE_TIME)
+            success = move_torso_and_head(robot, torso_pose, head_pose, minimum_time=minimum_time)
             future.set_result(success)
         except Exception as error:  # SDK 명령 예외는 메인 시퀀스에서 처리할 수 있도록 Future로 전달한다.
             future.set_exception(error)
 
     print(description)
-    threading.Thread(target=worker, name="head-pose", daemon=True).start()
+    threading.Thread(target=worker, name="torso-head-pose", daemon=True).start()
     return future
+
+
+def move_head_async(robot, head_pose, description: str, delay: float = 0.0) -> Future:
+    """Torso 기준을 유지하며 Head 명령을 선택적으로 지연해 주행과 겹친다."""
+    return move_torso_and_head_async(
+        robot,
+        INITIAL_TORSO,
+        head_pose,
+        description,
+        minimum_time=HEAD_MOVE_TIME,
+        delay=delay,
+    )
 
 
 def wait_for_head_move(future: Future, description: str) -> bool:
@@ -204,7 +203,13 @@ def finish_pending_head_move(future: Future | None, description: str) -> None:
             wait_for_head_move(future, description)
 
 
-def move_arms_async(robot, right_arm, left_arm, description: str) -> Future:
+def move_arms_async(
+    robot,
+    right_arm,
+    left_arm,
+    description: str,
+    minimum_time: float = ARM_UP_MOVE_TIME,
+) -> Future:
     """
     별도 thread에서 양팔 명령 실행
     """
@@ -212,7 +217,7 @@ def move_arms_async(robot, right_arm, left_arm, description: str) -> Future:
 
     def worker():
         try:
-            success = move_both_arms(robot, right_arm, left_arm, minimum_time=ARM_UP_MOVE_TIME)
+            success = move_both_arms(robot, right_arm, left_arm, minimum_time=minimum_time)
             future.set_result(success)
         except Exception as error:  # SDK 명령 예외는 메인 시퀀스에서 처리할 수 있도록 Future로 전달한다.
             future.set_exception(error)
@@ -255,7 +260,7 @@ def detect_grasp_and_lift(
     gripper_target: float,
     gripper_torque: float,
 ) -> bool:
-    """Tote를 정렬한 뒤 양팔을 BEFORE → GRASP → UP 순서로 이동해 파지한다."""
+    """GRASP에서 양팔과 Torso를 동시에 움직인 뒤 UP → PULL을 연속 수행한다."""
 
 
     print("[1/5] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
@@ -268,8 +273,24 @@ def detect_grasp_and_lift(
         print("BEFORE 자세 이동 실패")
         return False
 
-    print("[3/5] BEFORE → GRASP")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.5):
+    print("[3/5] BEFORE → GRASP (양팔 + Torso 동시 이동)")
+    grasp_arm_move = move_arms_async(
+        robot,
+        GRASP_RIGHT,
+        GRASP_LEFT,
+        "GRASP 양팔 이동 시작",
+        minimum_time=1.5,
+    )
+    grasp_torso_move = move_torso_and_head_async(
+        robot,
+        GRASP_TORSO,
+        HEAD_DOWN,
+        "GRASP Torso 이동 시작",
+        minimum_time=1.5,
+    )
+    grasp_arm_ok = wait_for_arm_move(grasp_arm_move, "GRASP 양팔 자세 이동")
+    grasp_torso_ok = wait_for_head_move(grasp_torso_move, "GRASP Torso 자세 이동")
+    if not (grasp_arm_ok and grasp_torso_ok):
         print("GRASP 자세 이동 실패")
         return False
 
@@ -277,16 +298,19 @@ def detect_grasp_and_lift(
     gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
     print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
 
-    print("[4/5] GRASP → UP")
-    if not move_both_arms(robot, UP_RIGHT, UP_LEFT, minimum_time=1.2):
-        print("UP 자세 이동 실패")
+    print("[4-5/5] GRASP → UP → PULL (Torso + 양팔 J-curve 연속 이동)")
+    if not move_torso_and_arms_through_waypoint(
+        robot,
+        start_pose={"torso": GRASP_TORSO, "right_arm": GRASP_RIGHT, "left_arm": GRASP_LEFT},
+        waypoint_pose={"torso": UP_TORSO, "right_arm": UP_RIGHT, "left_arm": UP_LEFT},
+        target_pose={"torso": UP_TORSO, "right_arm": PULL_RIGHT, "left_arm": PULL_LEFT},
+        lift_duration=LIFT_DURATION,
+        pull_duration=PULL_DURATION,
+        overlap_duration=LIFT_PULL_OVERLAP,
+        stream_rate_hz=LIFT_PULL_STREAM_RATE_HZ,
+    ):
+        print("GRASP → UP → PULL 연속 이동 실패")
         return False
-        
-    print("[5/5] UP -> PULL")
-    if not move_both_arms(robot, PULL_RIGHT, PULL_LEFT, minimum_time=1.2):
-        print("UP 자세 이동 실패")
-        return False
-        
 
     return True
 
@@ -465,7 +489,6 @@ def main() -> None:
     args = parser.parse_args()
 
     robot = initialize_mobile(args.address, args.model, power=".*", servo=".*", unlimited=False)
-
     gripper = None
     head_camera = RealSenseCamera(HEAD_CAM_WIDTH, HEAD_CAM_HEIGHT, HEAD_CAM_FPS, serial=args.camera_serial)
     tote_aligner = ToteAligner(camera=head_camera, show=args.show_tote)
@@ -504,6 +527,11 @@ def main() -> None:
 
         # 초기에는 Tote 시야를 위한 Torso / Head만 기준 자세로 맞춘다. 양팔 BEFORE 이동은 Tote 정렬 후에 수행한다.
         initial_head_move = move_head_async(robot, HEAD_DOWN, "초기 Torso / Head 기준 자세로 이동")
+        initial_arm_move = move_arms_async(robot, BEFORE_RIGHT, BEFORE_LEFT, "초기 양팔 BEFORE 자세로 이동")
+
+        if not wait_for_arm_move(initial_arm_move, "초기 양팔 BEFORE 자세 이동"):
+            raise RuntimeError("초기 양팔 BEFORE 자세 이동 실패")
+
         if not wait_for_head_move(initial_head_move, "초기 Torso / Head 자세 이동"):
             raise RuntimeError("초기 Torso / Head 자세 이동 실패")
 
