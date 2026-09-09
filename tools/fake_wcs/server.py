@@ -1,11 +1,15 @@
 """내부 테스트용 가짜 SFA WCS 서버 (표준 라이브러리만 사용).
 
-    python tools/fake_wcs/server.py                                   # http://0.0.0.0:5224
+    python tools/fake_wcs/server.py                                   # http://0.0.0.0:5224, 수동 발행
+    FAKE_WCS_AUTO_DISPATCH=1 python tools/fake_wcs/server.py          # 자동 반복 발행
     FAKE_WCS_ROBOT_URL=http://192.168.30.10:5225 python tools/fake_wcs/server.py
     FAKE_WCS_COOLDOWN_SEC=15 FAKE_WCS_PORT=5224 python tools/fake_wcs/server.py
 
 AMR 쪽 SFA-WCS 규격(v07.2)의 Transport Order / transport-events를 RBY1에 맞게 축소해 흉내 낸다.
 WCS가 로봇 측 오더 서버에 오더를 POST(push)하고, 로봇이 완료/실패를 콜백한다.
+
+기본은 **수동 발행**: 대시보드 "오더 발행" 카드에서 [오더 발행]을 눌러야 오더가 나간다.
+자동 발행(FAKE_WCS_AUTO_DISPATCH=1 또는 대시보드 토글)이면 READY가 될 때마다 자동으로 발행한다.
 
     READY ──(오더 POST → 로봇 ACCEPTED)──> RUNNING
     RUNNING ──(COMPLETED 콜백)──> COOLDOWN(15초) ──(만료)──> READY (다음 오더 발행)
@@ -23,6 +27,8 @@ WCS → 로봇 (이 서버가 호출):
     POST {FAKE_WCS_ROBOT_URL}/api/v1/wcs/transport-orders
     POST {FAKE_WCS_ROBOT_URL}/api/v1/wcs/transport-orders/{wcsOrderId}/cancel
 테스트 전용:
+    POST /api/test/order   {wcsOrderId?, carrierId?, fromStationId?, toStationId?, priority?}  수동 발행
+    POST /api/test/auto    {"enabled": true|false}                                             자동 발행 토글
     POST /api/test/resume, POST /api/test/cancel, GET /api/test/state, GET /  (대시보드)
 """
 from __future__ import annotations
@@ -49,10 +55,13 @@ ROBOT_ORDER_PATH = os.getenv("FAKE_WCS_ROBOT_ORDER_PATH", "/api/v1/wcs/transport
 FROM_STATION = os.getenv("FAKE_WCS_FROM_STATION", "RACK01_PORT01")
 TO_STATION = os.getenv("FAKE_WCS_TO_STATION", "CV02_IN")
 CARRIER_PREFIX = os.getenv("FAKE_WCS_CARRIER_PREFIX", "TOTE")
+AUTO_DISPATCH = os.getenv("FAKE_WCS_AUTO_DISPATCH", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+ORDER_FIELDS = ("wcsOrderId", "carrierId", "fromStationId", "toStationId", "priority")
 ORDER_RETRY_SEC = 2.0
 HTTP_TIMEOUT = 5.0
 HISTORY_MAX = 1000
 LOG_MAX = 100
+BUSY = -1  # _dispatch: 다른 발행이 진행 중이라 건너뜀
 
 STATUS_PREFIX = "/api/v1/rb/rby1/status"
 EVENT_PATH = "/api/v1/rb/transport-events"
@@ -71,9 +80,10 @@ def _str_bool(value: Any) -> bool:
 class WcsSimulator:
     """수신 status 저장 + 반송 오더 발행 상태 머신. 모든 상태는 lock 하나로 보호한다."""
 
-    def __init__(self, cooldown_sec: float) -> None:
+    def __init__(self, cooldown_sec: float, auto_dispatch: bool) -> None:
         self._lock = threading.Lock()
         self._cooldown_sec = cooldown_sec
+        self._auto = auto_dispatch
         self._state = "READY"
         self._order_seq = 0
         self._current_order: dict[str, Any] | None = None
@@ -81,9 +91,12 @@ class WcsSimulator:
         self._last_error: dict[str, Any] | None = None
         self._robot_reachable: bool | None = None
         self._robot_error_logged = False
+        self._dispatching = False
         self._history: dict[str, deque[dict[str, Any]]] = {}
         self._order_log: deque[dict[str, Any]] = deque(maxlen=LOG_MAX)
         self._event_log: deque[dict[str, Any]] = deque(maxlen=LOG_MAX)
+        # 통신 로그: 보낸 오더/취소 요청과 로봇 응답, 로봇이 보낸 이벤트와 우리 응답 (원본 그대로)
+        self._comm_log: deque[dict[str, Any]] = deque(maxlen=LOG_MAX)
         self._seen_event_ids: dict[str, str] = {}
         self._received = 0
 
@@ -95,11 +108,60 @@ class WcsSimulator:
                         and time.monotonic() >= self._cooldown_until:
                     self._cooldown_until = None
                     self._transition("READY", "대기 시간 만료")
-                should_dispatch = self._state == "READY"
+                should_dispatch = self._state == "READY" and self._auto
 
             if should_dispatch:
                 self._dispatch_order()
             stop.wait(ORDER_RETRY_SEC if not should_dispatch or self._robot_reachable is False else 0.5)
+
+    def set_auto(self, enabled: bool) -> bool:
+        """자동 발행 토글 (대시보드). 켜면 디스패처가 다음 루프에서 READY면 바로 발행한다."""
+        with self._lock:
+            if self._auto != enabled:
+                self._auto = enabled
+                log.info("발행 모드: %s", "자동" if enabled else "수동")
+            return self._auto
+
+    def dispatch_manual(self, fields: dict[str, Any]) -> tuple[bool, str, int]:
+        """대시보드 폼/curl로 오더 1건을 즉시 발행한다. (ok, message, http_code)"""
+        with self._lock:
+            if self._state == "COOLDOWN":
+                self._cooldown_until = None
+                self._transition("READY", "수동 발행으로 대기 종료")
+            if self._state != "READY":
+                return False, f"발행 불가 (state={self._state}) — 진행 중 오더가 끝나거나 [재개] 후 다시 시도", 409
+            order = self._build_order(self._order_seq + 1)
+
+        for key in ORDER_FIELDS:
+            value = fields.get(key)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            if key == "priority":
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    return False, f"priority는 정수여야 합니다: {value!r}", 400
+            else:
+                value = str(value).strip()
+            order[key] = value
+
+        code, body = self._dispatch(order)
+        if code == BUSY:
+            return False, body["error"], 409
+        if code is None:
+            return False, f"로봇 오더 서버 연결 실패: {body.get('error')}", 502
+        if self._state == "RUNNING" and self._current_order and \
+                self._current_order["wcsOrderId"] == order["wcsOrderId"]:
+            return True, f"발행 완료 {order['wcsOrderId']} ({order['fromStationId']} → {order['toStationId']}) HTTP {code}", 200
+        return False, f"오더 거절 HTTP {code}: {body}", 409
+
+    def _record_comm(self, direction: str, kind: str, url: str, request: Any,
+                     code: int | None, response: Any, order_id: str | None = None) -> None:
+        """대시보드 통신 로그 1건 (lock 밖에서 호출해도 되도록 자체 lock)."""
+        entry = {"at": _now_iso(), "direction": direction, "kind": kind, "url": url,
+                 "wcsOrderId": order_id, "request": request, "httpCode": code, "response": response}
+        with self._lock:
+            self._comm_log.appendleft(entry)
 
     def cancel_current(self) -> tuple[bool, str]:
         """진행 중 오더의 취소를 로봇에 요청한다 (v07.3 4.8). 대시보드 [취소] 버튼용."""
@@ -111,6 +173,8 @@ class WcsSimulator:
         payload = {"reasonCode": "OPERATOR_REQUEST", "reason": "가짜 WCS 대시보드 수동 취소",
                    "requestedAt": _now_iso()}
         code, body = self._post_robot_path(f"/{order_id}/cancel", payload, f"CANCEL-{order_id}")
+        self._record_comm("WCS→로봇", "취소 요청", f"POST {ROBOT_URL}{ROBOT_ORDER_PATH}/{order_id}/cancel",
+                          payload, code, body, order_id)
         with self._lock:
             if code in (200, 202) and isinstance(body, dict):
                 status = body.get("orderStatus", "CANCEL_REQUESTED")
@@ -122,27 +186,45 @@ class WcsSimulator:
             log.warning("%s", message)
             return False, message
 
+    @staticmethod
+    def _build_order(seq: int) -> dict[str, Any]:
+        return {
+            "wcsOrderId": f"WCS-{datetime.now().strftime('%Y%m%d')}-{seq:06d}",
+            "carrierId": f"{CARRIER_PREFIX}-{seq:06d}",
+            "fromStationId": FROM_STATION,
+            "toStationId": TO_STATION,
+            "priority": 5,
+            "timestamp": _now_iso(),
+        }
+
     def _dispatch_order(self) -> None:
+        """자동 발행: 기본값 오더를 만들어 보낸다."""
+        with self._lock:
+            order = self._build_order(self._order_seq + 1)
+        self._dispatch(order)
+
+    def _dispatch(self, order: dict[str, Any]) -> tuple[int | None, Any]:
+        """오더를 로봇에 POST하고 결과에 따라 상태 전이. (code, body) 반환. 동시 발행은 BUSY로 거른다."""
+        with self._lock:
+            if self._state != "READY" or self._dispatching:
+                return BUSY, {"error": f"발행 불가 (state={self._state}, dispatching={self._dispatching})"}
+            self._dispatching = True
+        try:
+            code, body = self._post_robot(order)
+        finally:
+            with self._lock:
+                self._dispatching = False
+        self._record_comm("WCS→로봇", "오더 발행", f"POST {ROBOT_URL}{ROBOT_ORDER_PATH}",
+                          order, code, body, order["wcsOrderId"])
         with self._lock:
             seq = self._order_seq + 1
-            order = {
-                "wcsOrderId": f"WCS-{datetime.now().strftime('%Y%m%d')}-{seq:06d}",
-                "carrierId": f"{CARRIER_PREFIX}-{seq:06d}",
-                "fromStationId": FROM_STATION,
-                "toStationId": TO_STATION,
-                "priority": 5,
-                "timestamp": _now_iso(),
-            }
-
-        code, body = self._post_robot(order)
-        with self._lock:
             if code is None:
                 if not self._robot_error_logged:
                     log.warning("로봇 오더 서버에 연결할 수 없습니다 (%s%s): %s — %.0f초마다 재시도",
                                 ROBOT_URL, ROBOT_ORDER_PATH, body.get("error"), ORDER_RETRY_SEC)
                     self._robot_error_logged = True
                 self._robot_reachable = False
-                return
+                return code, body
 
             self._robot_reachable = True
             self._robot_error_logged = False
@@ -155,6 +237,7 @@ class WcsSimulator:
                 self._last_error = {"wcsOrderId": order["wcsOrderId"], "message": f"오더 거절 HTTP {code}: {body}",
                                     "receivedAt": _now_iso()}
                 self._transition("HALTED", f"오더 발행 실패 HTTP {code}: {body}")
+            return code, body
 
     @staticmethod
     def _post_robot(order: dict[str, Any]) -> tuple[int | None, Any]:
@@ -187,7 +270,11 @@ class WcsSimulator:
         with self._lock:
             if event_id in self._seen_event_ids:
                 log.info("중복 이벤트 (멱등 처리): %s", event_id)
-                return {"accepted": True, "eventId": event_id, "receivedAt": self._seen_event_ids[event_id]}
+                reply = {"accepted": True, "eventId": event_id, "receivedAt": self._seen_event_ids[event_id]}
+                self._comm_log.appendleft({"at": _now_iso(), "direction": "로봇→WCS", "kind": "이벤트(중복)",
+                                           "url": f"POST {EVENT_PATH}", "wcsOrderId": event.get("wcsOrderId"),
+                                           "request": event, "httpCode": 200, "response": reply})
+                return reply
             self._seen_event_ids[event_id] = record["receivedAt"]
             self._event_log.appendleft(record)
 
@@ -215,7 +302,10 @@ class WcsSimulator:
             else:
                 self._current_order["orderStatus"] = event_type or self._current_order["orderStatus"]
 
-        return {"accepted": True, "eventId": event_id, "receivedAt": record["receivedAt"]}
+        reply = {"accepted": True, "eventId": event_id, "receivedAt": record["receivedAt"]}
+        self._record_comm("로봇→WCS", f"이벤트 {event_type or '?'}", f"POST {EVENT_PATH}", event, 200, reply,
+                          order_id or None)
+        return reply
 
     # ── status 수신 ─────────────────────────────────────────────
     def on_status(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -255,6 +345,11 @@ class WcsSimulator:
                 remaining = max(0.0, self._cooldown_until - time.monotonic())
             return {
                 "serverState": self._state,
+                "autoDispatch": self._auto,
+                "fromStation": FROM_STATION,
+                "toStation": TO_STATION,
+                "carrierPrefix": CARRIER_PREFIX,
+                "nextSeq": self._order_seq + 1,
                 "cooldownSec": self._cooldown_sec,
                 "cooldownRemaining": remaining,
                 "robotUrl": ROBOT_URL + ROBOT_ORDER_PATH,
@@ -263,6 +358,7 @@ class WcsSimulator:
                 "lastError": dict(self._last_error) if self._last_error else None,
                 "orderLog": list(self._order_log),
                 "eventLog": list(self._event_log),
+                "commLog": list(self._comm_log),
                 "received": self._received,
                 "latest": {serial: dict(records[0]) for serial, records in self._history.items() if records},
                 "serverTime": _now_iso(),
@@ -301,7 +397,7 @@ def _flatten(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-SIM = WcsSimulator(COOLDOWN_SEC)
+SIM = WcsSimulator(COOLDOWN_SEC, AUTO_DISPATCH)
 
 
 PAGE = """<!doctype html>
@@ -341,7 +437,30 @@ PAGE = """<!doctype html>
   .grp { color:var(--info); font-weight:700; padding-top:8px; }
   .full { grid-column:1/-1; }
   button { background:var(--info); color:#000; border:0; border-radius:6px; padding:6px 14px;
-           font-weight:700; cursor:pointer; margin-left:12px; }
+           font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.35; cursor:not-allowed; }
+  button.danger { background:var(--bad); color:#fff; }
+  button.okbtn { background:var(--ok); color:#000; }
+  .form .row { align-items:center; }
+  .form input[type=text], .form input[type=number] { flex:1; min-width:0; background:#000; color:var(--txt);
+           border:1px solid var(--line); border-radius:6px; padding:5px 8px; font:inherit; text-align:right; }
+  .form input::placeholder { color:var(--dim); opacity:.7; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .toggle { display:flex; align-items:center; gap:6px; margin-bottom:8px; cursor:pointer; }
+  .toggle input { width:16px; height:16px; accent-color:var(--ok); }
+  #orderMsg { min-height:1.5em; margin-top:8px; font-size:12px; word-break:break-all; }
+  .comm { display:flex; flex-direction:column; gap:10px; max-height:640px; overflow:auto; }
+  .comm .entry { border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .comm .head { display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:12px;
+                font-variant-numeric:tabular-nums; }
+  .comm .head .dir { font-weight:700; min-width:70px; }
+  .comm .head .kind { min-width:90px; }
+  .comm .head .code { min-width:60px; font-weight:700; }
+  .comm .head .url { color:var(--dim); flex:1; word-break:break-all; }
+  .comm .pair { display:grid; gap:8px; grid-template-columns:1fr 1fr; margin-top:6px; }
+  .comm .pair pre { max-height:none; }
+  .comm .pair .k { font-size:11px; color:var(--dim); margin-bottom:3px; }
+  @media (max-width:800px) { .comm .pair { grid-template-columns:1fr; } }
   .big { font-size:26px; font-weight:800; }
   #dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--dim);
          margin-right:5px; vertical-align:middle; }
@@ -352,12 +471,27 @@ PAGE = """<!doctype html>
 <div id="banner"></div>
 <div class="grid">
   <div class="card"><h2>서버 상태 / 현재 오더</h2><div id="server"></div></div>
+  <div class="card form"><h2>오더 발행 (WCS → 로봇)</h2>
+    <label class="toggle"><input type="checkbox" id="auto" onchange="toggleAuto(this)"> 자동 발행 (완료·취소 후 대기 시간 지나면 반복)</label>
+    <div class="row"><span class="k">wcsOrderId</span><input type="text" id="f_wcsOrderId" placeholder="비우면 자동"></div>
+    <div class="row"><span class="k">carrierId</span><input type="text" id="f_carrierId" placeholder="비우면 자동"></div>
+    <div class="row"><span class="k">fromStationId</span><input type="text" id="f_fromStationId"></div>
+    <div class="row"><span class="k">toStationId</span><input type="text" id="f_toStationId"></div>
+    <div class="row"><span class="k">priority</span><input type="number" id="f_priority" value="5" min="0" step="1"></div>
+    <div class="btns">
+      <button id="btnSend" class="okbtn" onclick="sendOrder()" disabled>오더 발행</button>
+      <button id="btnCancel" class="danger" onclick="cancelOrder()" disabled>현재 오더 취소</button>
+      <button id="btnResume" onclick="resume()" disabled>재개</button>
+    </div>
+    <div id="orderMsg" class="dim"></div>
+  </div>
   <div class="card"><h2>로봇 상태</h2><div class="tiles" id="state"></div></div>
   <div class="card"><h2>배터리</h2><div id="batt"></div></div>
   <div class="card"><h2>위치 (오도메트리)</h2><div id="pose"></div></div>
   <div class="card"><h2>제어 PC</h2><div id="sys"></div></div>
   <div class="card"><h2>오더 이력 (WCS → 로봇)</h2><div id="orderlog"></div></div>
   <div class="card"><h2>이벤트 이력 (로봇 → WCS)</h2><div id="eventlog"></div></div>
+  <div class="card full"><h2>통신 로그 — 오더 / 취소 / 이벤트 원본 (요청 → 응답)</h2><div id="commlog"></div></div>
   <div class="card full"><h2>엔코더 — 관절 (rad / deg)</h2><div id="enc"></div></div>
   <div class="card full"><h2>마지막 수신 status payload (원본)</h2><pre id="raw"></pre></div>
 </div>
@@ -379,16 +513,88 @@ const boolTile = (k, on, invert=false) => {
           <div class="v ${good?'ok':'bad'}">${on?'ON':'OFF'}</div></div>`;
 };
 
+let formInit = false;
+const $ = id => document.getElementById(id);
+const msg = (text, cls) => { const m = $("orderMsg"); m.textContent = text; m.className = cls; };
+
+async function post(path, body) {
+  const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+                               body: body === undefined ? null : JSON.stringify(body)});
+  let b = {};
+  try { b = await r.json(); } catch (e) { b = {ok:false, message:"HTTP " + r.status}; }
+  return b;
+}
+
 async function resume() {
-  await fetch("/api/test/resume", {method:"POST"});
+  await post("/api/test/resume");
+  msg("재개 → READY", "info");
   tick();
 }
 
 async function cancelOrder() {
-  const r = await fetch("/api/test/cancel", {method:"POST"});
-  const b = await r.json();
-  if (!b.ok) alert(b.message);
+  $("btnCancel").disabled = true;
+  const b = await post("/api/test/cancel");
+  msg(b.message, b.ok ? "warn" : "bad");
   tick();
+}
+
+async function sendOrder() {
+  const fields = {};
+  for (const k of ["wcsOrderId","carrierId","fromStationId","toStationId","priority"]) {
+    const v = $("f_" + k).value.trim();
+    if (v !== "") fields[k] = v;
+  }
+  $("btnSend").disabled = true;
+  msg("발행 중…", "dim");
+  const b = await post("/api/test/order", fields);
+  msg(b.message, b.ok ? "ok" : "bad");
+  if (b.ok) { $("f_wcsOrderId").value = ""; $("f_carrierId").value = ""; }
+  tick();
+}
+
+async function toggleAuto(el) {
+  const b = await post("/api/test/auto", {enabled: el.checked});
+  msg(b.autoDispatch ? "자동 발행 ON — READY가 되면 자동으로 발행합니다" : "자동 발행 OFF — [오더 발행]으로만 발행합니다", "info");
+  tick();
+}
+
+let commKey = "";
+function renderComm(list) {
+  const key = list.length ? list[0].at + list.length : "";
+  if (key === commKey) return;  // 새 항목 없으면 다시 그리지 않음 (스크롤 위치 유지)
+  commKey = key;
+  const el = $("commlog");
+  if (!list.length) { el.innerHTML = `<div class="dim">아직 주고받은 오더/취소/이벤트 없음</div>`; return; }
+  const esc = v => String(v).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  const codeCls = c => c === null ? "bad" : c < 300 ? "ok" : c < 500 ? "warn" : "bad";
+  el.innerHTML = `<div class="comm">` + list.map(e => {
+    const fromWcs = e.direction.startsWith("WCS");
+    const kindCls = /FAILED/.test(e.kind) ? "bad" : /CANCEL/.test(e.kind) ? "warn" : "";
+    return `<div class="entry">
+      <div class="head"><span class="dim">${ts(e.at)}</span><span class="dir ${fromWcs ? "info" : "ok"}">${esc(e.direction)}</span>
+        <span class="kind ${kindCls}">${esc(e.kind)}</span><span>${esc(e.wcsOrderId ?? "—")}</span>
+        <span class="code ${codeCls(e.httpCode)}">${e.httpCode === null ? "연결 실패" : "HTTP " + e.httpCode}</span>
+        <span class="url">${esc(e.url)}</span></div>
+      <div class="pair">
+        <div><div class="k">요청 (${fromWcs ? "WCS가 보냄" : "로봇이 보냄"})</div><pre>${esc(JSON.stringify(e.request, null, 2))}</pre></div>
+        <div><div class="k">응답 (${fromWcs ? "로봇 회신" : "WCS 회신"})</div><pre>${esc(JSON.stringify(e.response, null, 2))}</pre></div>
+      </div></div>`;
+  }).join("") + `</div>`;
+}
+
+function syncForm(s) {
+  if (!formInit) {
+    $("f_fromStationId").value = s.fromStation;
+    $("f_toStationId").value = s.toStation;
+    formInit = true;
+  }
+  if (document.activeElement !== $("auto")) $("auto").checked = !!s.autoDispatch;
+  const st = s.serverState;
+  $("btnSend").disabled = !(st === "READY" || st === "COOLDOWN");
+  $("btnCancel").disabled = st !== "RUNNING";
+  $("btnResume").disabled = st !== "HALTED";
+  $("f_wcsOrderId").placeholder = `비우면 WCS-${new Date().toISOString().slice(0,10).replace(/-/g,"")}-${String(s.nextSeq).padStart(6,"0")}`;
+  $("f_carrierId").placeholder = `비우면 ${s.carrierPrefix}-${String(s.nextSeq).padStart(6,"0")}`;
 }
 
 async function tick() {
@@ -418,17 +624,18 @@ async function tick() {
     const e = s.lastError || {};
     b += `<div class="banner err">오더 실패 — 발행 중단 (${e.wcsOrderId ?? "—"}, ${ts(e.receivedAt)})<br>
           <span style="font-weight:400">message: ${e.message ? e.message : "<i>(없음)</i>"}</span>
-          <button onclick="resume()">재개</button></div>`;
+          <button onclick="resume()" style="margin-left:12px">재개</button></div>`;
   }
   if (s.robotReachable === false) b += `<div class="banner warn">로봇 오더 서버(${s.robotUrl})에 연결할 수 없습니다 — 데모가 DRY_RUN=0으로 떠 있는지, 주소/포트가 맞는지 확인</div>`;
   if (d && d.sourceIsStale) b += `<div class="banner warn">isStale=true — 로봇 측 업로더가 SDK 상태를 2초 이상 못 받고 있습니다</div>`;
   if (d && !live) b += `<div class="banner warn">${age.toFixed(0)}초간 새 status가 없습니다 — 데모/업로더 동작 확인</div>`;
   document.getElementById("banner").innerHTML = b;
 
+  syncForm(s);
   const o = s.currentOrder;
   document.getElementById("server").innerHTML =
-    `<div class="big ${STATE_CLS[s.serverState] || ''}">${s.serverState}${
-       s.serverState === 'RUNNING' ? '<button onclick="cancelOrder()">현재 오더 취소</button>' : ''}</div>
+    `<div class="big ${STATE_CLS[s.serverState] || ''}">${s.serverState}</div>
+     <div class="row"><span class="k">발행 모드</span><span class="v ${s.autoDispatch?'ok':'info'}">${s.autoDispatch ? "자동" : "수동"}</span></div>
      <div class="row"><span class="k">로봇 오더 서버</span><span class="v ${s.robotReachable===false?'bad':s.robotReachable?'ok':'dim'}">${s.robotUrl}</span></div>
      <div class="row"><span class="k">현재 오더</span><span class="v">${o ? o.wcsOrderId : "—"}</span></div>
      <div class="row"><span class="k">from → to</span><span class="v">${o ? `${o.fromStationId} → ${o.toStationId}` : "—"}</span></div>
@@ -440,12 +647,14 @@ async function tick() {
   document.getElementById("orderlog").innerHTML = s.orderLog.length
     ? `<table><tr><th>wcsOrderId</th><th>carrier</th><th>상태</th><th>발행</th></tr>` +
       s.orderLog.map(c => `<tr><td>${c.wcsOrderId}</td><td>${c.carrierId}</td><td>${c.orderStatus}</td><td>${ts(c.acceptedAt)}</td></tr>`).join("") + `</table>`
-    : `<div class="dim">아직 발행한 오더 없음 (로봇 오더 서버가 응답하면 발행)</div>`;
+    : `<div class="dim">아직 발행한 오더 없음 ([오더 발행] 또는 자동 발행 ON)</div>`;
 
   document.getElementById("eventlog").innerHTML = s.eventLog.length
     ? `<table><tr><th>wcsOrderId</th><th>type</th><th>result</th><th>message</th><th>수신</th></tr>` +
       s.eventLog.map(e => `<tr><td>${e.wcsOrderId ?? ""}</td><td class="${e.eventType==='FAILED'?'bad':e.eventType==='COMPLETED'?'ok':''}">${e.eventType ?? ""}</td><td>${e.result ?? ""}</td><td style="text-align:left">${e.message ?? ""}</td><td>${ts(e.receivedAt)}</td></tr>`).join("") + `</table>`
     : `<div class="dim">아직 수신한 이벤트 없음</div>`;
+
+  renderComm(s.commLog);
 
   if (!d) {
     for (const id of ["state","batt","pose","sys","enc","raw"]) document.getElementById(id).innerHTML = `<span class="dim">—</span>`;
@@ -540,6 +749,24 @@ class Handler(BaseHTTPRequestHandler):
                               {"ok": ok, "message": message,
                                "serverState": SIM.dashboard_state()["serverState"]})
 
+        if path in ("/api/test/order", "/api/test/auto"):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8") if length else ""
+            try:
+                fields = json.loads(raw) if raw.strip() else {}
+            except ValueError as error:
+                return self._json(400, {"ok": False, "message": f"invalid JSON: {error}"})
+            if not isinstance(fields, dict):
+                return self._json(400, {"ok": False, "message": "body must be an object"})
+            if path == "/api/test/auto":
+                enabled = SIM.set_auto(bool(fields.get("enabled")))
+                return self._json(200, {"ok": True, "autoDispatch": enabled})
+            ok, message, code = SIM.dispatch_manual(fields)
+            state = SIM.dashboard_state()
+            return self._json(code, {"ok": ok, "message": message,
+                                     "serverState": state["serverState"],
+                                     "currentOrder": state["currentOrder"]})
+
         if path == EVENT_PATH or path == STATUS_PREFIX or path.startswith(STATUS_PREFIX + "/"):
             length = int(self.headers.get("Content-Length") or 0)
             try:
@@ -584,6 +811,7 @@ def main() -> int:
     log.info("가짜 WCS 서버: http://%s:%d  (대시보드 http://localhost:%d, 완료 후 대기 %.0f초)",
              BIND, PORT, PORT, COOLDOWN_SEC)
     log.info("오더 발행 대상(로봇): POST %s%s  (%s -> %s)", ROBOT_URL, ROBOT_ORDER_PATH, FROM_STATION, TO_STATION)
+    log.info("발행 모드: %s", "자동 (READY마다 발행)" if AUTO_DISPATCH else "수동 (대시보드 [오더 발행] 또는 POST /api/test/order)")
     log.info("로봇 측: WCS_BASE_URL=http://<이 PC IP>:%d DRY_RUN=0 python demo_full_sequence_loop.py", PORT)
 
     stop = threading.Event()

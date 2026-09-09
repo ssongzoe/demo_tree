@@ -24,12 +24,19 @@ RBY1 ──POST /api/v1/rb/transport-events──▶ WCS                        
 ### 1. 서버 기동 (아무 PC)
 
 ```bash
-python tools/fake_wcs/server.py                                   # :5224, 로봇 http://127.0.0.1:5225 에 오더 발행
+python tools/fake_wcs/server.py                                   # :5224, 로봇 http://127.0.0.1:5225 에 오더 발행 (수동)
+FAKE_WCS_AUTO_DISPATCH=1 python tools/fake_wcs/server.py          # 자동 반복 발행 (완료 후 COOLDOWN 지나면 다음 오더)
 FAKE_WCS_ROBOT_URL=http://<로봇PC IP>:5225 FAKE_WCS_COOLDOWN_SEC=15 python tools/fake_wcs/server.py
 ```
 
-대시보드: `http://localhost:5224` — 서버 상태/현재 오더/대기 잔여, 오더·이벤트 이력, 로봇 상태(작업·에러 메시지 포함),
-배터리, pose, 엔코더 26관절, 원본 payload. FAILED로 멈추면 **[재개]** 버튼.
+기본은 **수동 발행**이라 서버를 띄워도 오더가 나가지 않는다. 대시보드의 **오더 발행** 카드에서
+wcsOrderId/carrierId(비우면 자동 채번), fromStationId/toStationId, priority를 넣고 **[오더 발행]**을 누르면 로봇에 POST된다.
+같은 카드의 **자동 발행** 체크박스를 켜면 READY가 될 때마다 기본값 오더를 자동 발행한다(기존 동작).
+
+대시보드: `http://localhost:5224` — 서버 상태/발행 모드/현재 오더/대기 잔여, 오더 발행 폼([오더 발행]·[현재 오더 취소]·[재개]),
+오더·이벤트 이력, **통신 로그**(보낸 오더/취소 요청과 로봇 회신, 로봇이 보낸 COMPLETED/FAILED/CANCELED 이벤트와 WCS 응답을
+요청→응답 JSON 원본을 status payload처럼 항상 펼쳐서 표시), 로봇 상태(작업·에러 메시지 포함), 배터리, pose, 엔코더 26관절, 원본 payload.
+버튼은 상태에 맞을 때만 활성화된다: 발행은 READY/COOLDOWN(COOLDOWN이면 대기를 끊고 즉시 발행), 취소는 RUNNING, 재개는 HALTED.
 
 ### 2. 데모 실행 (로봇 PC)
 
@@ -51,11 +58,13 @@ WCS_BASE_URL=http://<서버PC IP>:5224 DRY_RUN=0 python demo_full_sequence_loop.
 ### 3. 로봇 없이 서버만 검증
 
 ```bash
+FAKE_WCS_AUTO_DISPATCH=1 python tools/fake_wcs/server.py                # 자동 발행으로 서버 기동 (수동이면 대시보드에서 발행)
 DRY_RUN=0 python tools/fake_wcs/sim_robot.py --work-sec 3 --cycles 2   # 2사이클 후 종료 (--cycles 0: 무한)
 DRY_RUN=0 python tools/fake_wcs/sim_robot.py --error "테스트 오류"       # FAILED → 서버 HALTED → 대시보드 [재개]
 ```
 
-`DRY_RUN=0`을 빼면(기본 true) 아무것도 보내지 않는다. 정상이면 가짜 로봇 로그가 아래 순서로 흐른다:
+`DRY_RUN=0`을 빼면(기본 true) 아무것도 보내지 않는다. sim_robot은 `requests`가 필요하므로 그 패키지가 있는 python으로 실행한다.
+정상이면 가짜 로봇 로그가 아래 순서로 흐른다:
 
 ```
 WCS health check: HTTP 200 -> OK                              로봇→서버 GET /health
@@ -78,6 +87,11 @@ curl localhost:5224/health                                          # healthy
 curl localhost:5224/api/test/state | python3 -m json.tool            # 서버 상태·오더/이벤트 이력 JSON
 curl localhost:5224/api/v1/rb/rby1/status/RBY1-001/latest            # 마지막 수신 status 레코드
 curl -X POST localhost:5224/api/test/resume                          # HALTED 해제
+curl -X POST localhost:5224/api/test/cancel                          # 진행 중 오더 취소 요청 (RUNNING일 때만)
+# 수동 발행: 필드는 모두 선택, 비우면 기본값(wcsOrderId/carrierId 자동 채번, from/to는 FAKE_WCS_*_STATION, priority 5)
+curl -X POST localhost:5224/api/test/order -H 'Content-Type: application/json' -d '{"toStationId":"CV03_IN","priority":7}'
+# → 200 {"ok":true,"message":"발행 완료 …"} / RUNNING 등 발행 불가 상태면 409 / 로봇 연결 실패 502 / priority 정수 아님 400
+curl -X POST localhost:5224/api/test/auto -H 'Content-Type: application/json' -d '{"enabled":true}'   # 자동 발행 토글
 
 # 로봇 오더 서버가 떠 있을 때(sim_robot 또는 데모 실행 중) 오더를 직접 POST
 curl -X POST localhost:5225/api/v1/wcs/transport-orders -H 'Content-Type: application/json' \
@@ -107,7 +121,6 @@ curl -X POST localhost:5225/api/v1/wcs/transport-orders -H 'Content-Type: applic
 | 로봇→WCS | `POST /api/v1/rb/rby1/status` | 기존 status payload 1Hz → 201 `{"accepted":true}` |
 | 로봇→WCS | `GET /health` | `healthy` |
 | 조회 | `GET /api/v1/rb/rby1/status/{serial}/latest`, `…/history?limit=N` | 실 WCS와 같은 평탄화 레코드 + `errorMessage` 컬럼 |
-| 테스트 | `POST /api/test/resume`, `GET /api/test/state` | HALTED 해제 / 대시보드용 상태 |
+| 테스트 | `POST /api/test/order`, `POST /api/test/auto`, `POST /api/test/cancel`, `POST /api/test/resume`, `GET /api/test/state` | 수동 발행 / 자동 발행 토글 / 취소 / HALTED 해제 / 대시보드용 상태 |
 
 실 WCS와 다른 점: `/api/test/*`는 가짜 서버 전용. 실 WCS는 `error_message`를 컬럼으로 저장하지 않는다(2026-08-27 기준).
-오더 취소(AMR 4.8)는 아직 미구현.
