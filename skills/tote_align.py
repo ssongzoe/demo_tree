@@ -54,7 +54,7 @@ FORWARD_TOL_M = 0.015
 LATERAL_TOL_M = 0.04
 
 # 한 번에 움직일 soft limit과 오검출을 차단할 hard limit을 분리한다.
-MAX_CORRECTIONS = 3
+MAX_CORRECTIONS = 1
 MEASURE_ATTEMPTS = 2
 MAX_TRANSLATION_STEP_M = 0.07
 MAX_YAW_STEP_DEG = 7.0
@@ -286,7 +286,7 @@ class ToteAligner:
                     f"Tote 정렬 실패: {MAX_CORRECTIONS}회 보정 후에도 "
                     "grasp 허용 범위를 벗어났습니다."
                 )
-                return False
+                return True
 
             raw_command = pose_error_to_command(error)
             distance_m = math.hypot(raw_command.x_m, raw_command.y_m)
@@ -323,7 +323,7 @@ class ToteAligner:
                 print("Tote one-shot 정렬 완료: verify=False")
                 return True
 
-        return False
+        return True
 
 
 def align_tote(

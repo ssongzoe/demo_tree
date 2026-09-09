@@ -63,8 +63,8 @@ INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 BEFORE_RIGHT = np.deg2rad([-38.23, -53.19, -21.31, -48.14, -63.73, 81.18, 2.39]).tolist()
 BEFORE_LEFT = np.deg2rad([-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]).tolist()
 
-GRASP_RIGHT = np.deg2rad([-29.44, -25.47, -27.98, -83.08, -60.68, 90.04, -10.97]).tolist()
-GRASP_LEFT = np.deg2rad([-29.45, 25.49, 28.05, -82.82, 60.79, 89.98, 10.78]).tolist()
+GRASP_RIGHT = np.deg2rad([-28.592, -28.537, -30.579, -80.469, -63.332, 91.746, -7.972]).tolist()
+GRASP_LEFT = np.deg2rad([-28.592, 28.537, 30.579, -80.469, 63.332, 91.746, 7.972]).tolist()
 GRASP_TORSO = np.deg2rad([0.02, 33.00, -52.01, 40.00, 0.05, 0.01]).tolist()
 
 UP_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
@@ -77,14 +77,19 @@ PULL_LEFT = np.deg2rad([-4.50, 28.21, 33.62, -106.81, 74.26, 99.28, 19.52]).toli
 DOWN_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
 DOWN_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
 
-STRETCH_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
-STRETCH_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
+# STRETCH_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
+# STRETCH_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
+
+STRETCH_RIGHT = np.deg2rad([-39.812, -36.426, -20.479, -60.830, -65.634, 89.689, -10.742]).tolist()
+STRETCH_LEFT = np.deg2rad([-39.812, 36.426, 20.479, -60.830, 65.634, 89.689, 10.742]).tolist()
+STRETCH_TORSO = np.deg2rad([0.000, 33.773, -46.870, 23.097, 0.000, 0.001]).tolist()
+
 
 AFTER_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
 AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
 
-BACK_RIGHT = np.deg2rad([-17.36, -31.32, -35.09, -99.56, -59.69, 98.00, -13.33]).tolist()
-BACK_LEFT = np.deg2rad([-17.36, 31.32, 35.09, -99.56, 59.69, 98.00, 13.33]).tolist()
+BACK_RIGHT = np.deg2rad([-13.642, -27.690, -33.932, -95.436, -56.100, 59.591, -7.149]).tolist()
+BACK_LEFT = np.deg2rad([-13.642, 27.690, 33.932, -95.436, 56.100, 59.591, 7.149]).tolist()
 
 HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
 HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
@@ -105,13 +110,13 @@ LIFT_PULL_STREAM_RATE_HZ = 100.0
 # 아래 target 값만 수정하면 실제 실행 로그도 현재 값에 맞춰 자동으로 바뀐다.
 # -----------------------------------------------------------------------------
 
-OUTBOUND_DIRECT_TARGET = (-0.80, 0.80, math.radians(+181.85))
+OUTBOUND_DIRECT_TARGET = (-0.80, 1.40, math.radians(+181.85))
 OUTBOUND_DIRECT_DURATION = 8.0 # 가는거 8초
 OUTBOUND_HEAD_DELAY = 3.0
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 
-RETURN_TURN_AND_STRAIGHT_TARGET = (0.60, 0.7, math.radians(-183.43))
+RETURN_TURN_AND_STRAIGHT_TARGET = (-0.80, 1.5, math.radians(-183.43))
 RETURN_TURN_AND_STRAIGHT_DURATION = 9.0 #오는거 9초
 
 # ------------------------------------------------------------------
@@ -352,6 +357,16 @@ def run_turn_and_go(robot, monitor) -> bool:
 def lower_release_and_retract(robot, gripper) -> bool:
     """AR 정렬 후 UP에서 DOWN로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 AFTER 자세로 양팔을 후퇴한다."""
     print("[1/6] UP → stretch")
+    
+    stretch_torso_move = move_torso_and_head_async(
+        robot,
+        STRETCH_TORSO,
+        HEAD_FORWARD,
+        "STRETCH Torso 이동 시작",
+        minimum_time=1.5,
+    )
+    
+    
     if not move_both_arms(robot, STRETCH_RIGHT, STRETCH_LEFT, minimum_time=1.0):
         print("STRETCH 자세 이동 실패")
         return False
