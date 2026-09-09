@@ -22,13 +22,13 @@
       "type": "string",
       "minLength": 1,
       "description": "출발 Station ID. RB-Y1은 참조만 하며 없어도 오더를 접수합니다.",
-      "examples": ["RACK01_PORT01", "CV02_OUT", "CV03_OUT"]
+      "examples": ["RACK01_PORT02", "CV02_OUT", "CV03_OUT"]
     },
     "toStationId": {
       "type": "string",
       "minLength": 1,
       "description": "도착 Station ID. RB-Y1은 참조만 하며 없어도 오더를 접수합니다.",
-      "examples": ["CV02_IN", "CV03_IN", "RACK01_PORT01"]
+      "examples": ["CV02_OUT", "CV03_IN", "RACK01_PORT02"]
     },
     "priority": {
       "type": "integer",

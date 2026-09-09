@@ -80,12 +80,12 @@ DRY_RUN=0 python tools/fake_wcs/sim_robot.py --error "테스트 오류"       # 
 WCS health check: HTTP 200 -> OK                              로봇→서버 GET /health
 반송 오더 수신 서버 시작: http://0.0.0.0:5225/...              로봇 측 오더 서버 오픈
 WCS status POST OK -> HTTP 201                                 로봇→서버 상태 업로드 (이후 1Hz)
-반송 오더 수신: WCS-20260903-000001 (CV02_IN -> RACK01_PORT01)  서버→로봇 오더 POST
+반송 오더 수신: WCS-20260903-000001 (CV02_OUT -> RACK01_PORT02)  서버→로봇 오더 POST
 사이클 1 시작
 WCS transport-event OK: ARRIVED_AT_FROM …                      From 도착 보고
-LOAD readiness CV02_IN: READY (1회 조회, 0초) -> 로딩 시작
+LOAD readiness CV02_OUT: READY (1회 조회, 0초) -> 로딩 시작
 WCS transport-event OK: ARRIVED_AT_TO …                        To 도착 보고
-UNLOAD readiness RACK01_PORT01: READY (1회 조회, 0초) -> 언로딩 시작
+UNLOAD readiness RACK01_PORT02: READY (1회 조회, 0초) -> 언로딩 시작
 사이클 1 완료
 WCS transport-event OK: COMPLETED WCS-…-000001 -> HTTP 200     로봇→서버 완료 콜백
 (서버가 COOLDOWN 후 오더 #2 발행 → 반복)
@@ -97,10 +97,10 @@ WCS publisher 종료: sent=N failed=0
 
 readiness 시나리오(규격 11장 T-03/T-04) 재현:
 
-- **T-03 NOT_READY 후 READY**: PIO 카드에서 `CV02_IN` LOAD를 NOT_READY로 두고 [오더 발행] → 로봇이 파지 전에 멈춰
+- **T-03 NOT_READY 후 READY**: PIO 카드에서 `CV02_OUT` LOAD를 NOT_READY로 두고 [오더 발행] → 로봇이 파지 전에 멈춰
   "NOT_READY — 2초마다 재확인"을 남기고 카드에 "로봇 대기 중 · N회"가 뜬다 → READY를 누르면 즉시 진행.
-- **T-04 대기 초과**: `READINESS_MAX_WAIT_SEC=10`으로 로봇을 띄우고 `RACK01_PORT01` UNLOAD를 NOT_READY로 두면 10초 후 로봇이
-  `PIO_NOT_READY_TIMEOUT: UNLOAD RACK01_PORT01 10s`를 message로 FAILED를 보고하고 서버는 HALTED가 된다.
+- **T-04 대기 초과**: `READINESS_MAX_WAIT_SEC=10`으로 로봇을 띄우고 `RACK01_PORT02` UNLOAD를 NOT_READY로 두면 10초 후 로봇이
+  `PIO_NOT_READY_TIMEOUT: UNLOAD RACK01_PORT02 10s`를 message로 FAILED를 보고하고 서버는 HALTED가 된다.
 - **대기 중 취소**: NOT_READY로 로봇이 기다리는 동안 [현재 오더 취소] → 로봇이 다음 폴링 전에 CANCELED를 보고한다.
 
 ### 4. curl로 개별 엔드포인트 확인
@@ -116,13 +116,13 @@ curl -X POST localhost:5224/api/test/order -H 'Content-Type: application/json' -
 # → 200 {"ok":true,"message":"발행 완료 …"} / RUNNING 등 발행 불가 상태면 409 / 로봇 연결 실패 502 / priority 정수 아님 400
 curl -X POST localhost:5224/api/test/auto -H 'Content-Type: application/json' -d '{"enabled":true}'   # 자동 발행 토글
 # PIO readiness (v07.4 9장): 로봇이 묻는 GET 과 설비 상태를 바꾸는 테스트 전용 POST
-curl 'localhost:5224/api/v1/rb/stations/CV02_IN/readiness?operation=LOAD&wcsOrderId=X'            # 기본 READY
+curl 'localhost:5224/api/v1/rb/stations/CV02_OUT/readiness?operation=LOAD&wcsOrderId=X'            # 기본 READY
 curl -X POST localhost:5224/api/test/readiness -H 'Content-Type: application/json' \
-  -d '{"stationId":"RACK01_PORT01","operation":"UNLOAD","status":"NOT_READY","reasonCode":"RACK_FULL"}'
+  -d '{"stationId":"RACK01_PORT02","operation":"UNLOAD","status":"NOT_READY","reasonCode":"RACK_FULL"}'
 
 # 로봇 오더 서버가 떠 있을 때(sim_robot 또는 데모 실행 중) 오더를 직접 POST
 curl -X POST localhost:5225/api/v1/wcs/transport-orders -H 'Content-Type: application/json' \
-  -d '{"wcsOrderId":"T-1","carrierId":"TOTE-1","fromStationId":"CV02_IN","toStationId":"RACK01_PORT01","priority":5,"timestamp":"x"}'
+  -d '{"wcsOrderId":"T-1","carrierId":"TOTE-1","fromStationId":"CV02_OUT","toStationId":"RACK01_PORT02","priority":5,"timestamp":"x"}'
 # → 201 ACCEPTED. 같은 내용 재전송 → 200(멱등). toStationId를 바꿔 재전송 → 409 DUPLICATE_ORDER_CONFLICT
 ```
 

@@ -28,7 +28,7 @@
     "nodeId": {
       "type": ["string", "null"],
       "description": "도착 보고(ARRIVED_AT_*)에서 도착한 위치. RB 토폴로지 nodeId가 확정되기 전까지 오더의 fromStationId/toStationId 값을 그대로 넣습니다(규격서 8.2). 최종 결과 이벤트에는 넣지 않습니다.",
-      "examples": ["RACK01_PORT01", "CV02_IN"]
+      "examples": ["RACK01_PORT02", "CV02_OUT"]
     },
     "robotSerial": {
       "type": "string",
@@ -45,7 +45,7 @@
       "type": ["string", "null"],
       "maxLength": 200,
       "description": "실패 사유.  성공 시에는 null 입니다. 같은 내용이 상태 업로드의 robot_state.error_message 로도 전송됩니다.",
-      "examples": [null, "Tote 인식 / 정렬 / 파지 실패", "PIO_NOT_READY_TIMEOUT: UNLOAD CV02_IN 120s (reasonCode=CONVEYOR_FULL)"]
+      "examples": [null, "Tote 인식 / 정렬 / 파지 실패", "PIO_NOT_READY_TIMEOUT: UNLOAD CV02_OUT 120s (reasonCode=CONVEYOR_FULL)"]
     },
     "occurredAt": {
       "type": "string",

@@ -39,8 +39,8 @@ def _bool(key: str, default: bool) -> bool:
 
 
 # SFA 개발서버
-WCS_BASE_URL = os.getenv("WCS_BASE_URL", "http://localhost:5224")
-# WCS_BASE_URL = os.getenv("WCS_BASE_URL", "http://192.168.200.71:5224")
+# WCS_BASE_URL = os.getenv("WCS_BASE_URL", "http://localhost:5224")
+WCS_BASE_URL = os.getenv("WCS_BASE_URL", "http://192.168.200.71:5224")
 WCS_HEALTH_PATH = os.getenv("WCS_HEALTH_PATH", "/health")
 WCS_STATUS_PATH = os.getenv("WCS_STATUS_PATH", "/api/v1/rb/rby1/status")
 # 반송 완료/실패 보고 (AMR FRS→WCS transport-events callback 규격 준용)

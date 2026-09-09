@@ -6,7 +6,7 @@ WCS가 로봇 측으로 오더를 POST하고, 로봇은 즉시 ACCEPTED로 응�
 
     POST {ROBOT_ORDER_PATH}
     { "wcsOrderId": "WCS-20260902-000001", "carrierId": "TOTE-000001",
-    "fromStationId": "CV02_IN", "toStationId": "RACK01_PORT01",
+    "fromStationId": "CV02_OUT", "toStationId": "RACK01_PORT02",
       "priority": 5, "timestamp": "2026-09-02T09:00:00.000Z" }
     -> 201 { "wcsOrderId": ..., "orderStatus": "ACCEPTED", "timestamp": ... }
        200 동일 wcsOrderId·동일 내용 재전송 (현재 상태 반환, 멱등)

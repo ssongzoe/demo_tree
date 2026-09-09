@@ -33,8 +33,8 @@
       "body": {
         "wcsOrderId": "WCS-20260903-000001",
         "carrierId": "TOTE-000001",
-        "fromStationId": "CV02_IN",
-        "toStationId": "RACK01_PORT01",
+        "fromStationId": "CV02_OUT",
+        "toStationId": "RACK01_PORT02",
         "priority": 5,
         "timestamp": "2026-09-03T05:00:00.000Z"
       },
@@ -56,37 +56,37 @@
       "direction": "RB-Y1 → WCS",
       "request": "POST /api/v1/rb/transport-events",
       "note": "From 도착 보고 (파지 직전). 오더는 계속 진행 중이며 상태 전이는 없습니다.",
-      "body": { "eventId": "0f3c…", "wcsOrderId": "WCS-20260903-000001", "eventType": "ARRIVED_AT_FROM", "robotSerial": "RBY1-001", "nodeId": "CV02_IN", "result": "SUCCESS", "message": null, "occurredAt": "2026-09-03T05:00:01.000Z" },
+      "body": { "eventId": "0f3c…", "wcsOrderId": "WCS-20260903-000001", "eventType": "ARRIVED_AT_FROM", "robotSerial": "RBY1-001", "nodeId": "CV02_OUT", "result": "SUCCESS", "message": null, "occurredAt": "2026-09-03T05:00:01.000Z" },
       "response": { "http": 200, "body": { "accepted": true, "eventId": "0f3c…", "receivedAt": "2026-09-03T05:00:01.050Z" } }
     },
     {
       "step": 5,
       "direction": "RB-Y1 → WCS",
-      "request": "GET /api/v1/rb/stations/CV02_IN/readiness?operation=LOAD&wcsOrderId=WCS-20260903-000001",
+      "request": "GET /api/v1/rb/stations/CV02_OUT/readiness?operation=LOAD&wcsOrderId=WCS-20260903-000001",
       "note": "로딩(파지) 시작 가능 여부 확인 (규격서 9장). NOT_READY면 2초마다 재확인하고, 120초를 넘기면 FAILED(PIO_NOT_READY_TIMEOUT)로 보고합니다. 대기 중 취소 요청이 오면 CANCELED로 종료합니다.",
-      "response": { "http": 200, "body": { "stationId": "CV02_IN", "operation": "LOAD", "status": "NOT_READY", "ready": false, "reasonCode": "CONVEYOR_BUSY", "updatedAt": "2026-09-03T05:00:00.000Z" } }
+      "response": { "http": 200, "body": { "stationId": "CV02_OUT", "operation": "LOAD", "status": "NOT_READY", "ready": false, "reasonCode": "CONVEYOR_BUSY", "updatedAt": "2026-09-03T05:00:00.000Z" } }
     },
     {
       "step": 6,
       "direction": "RB-Y1 → WCS",
-      "request": "GET /api/v1/rb/stations/CV02_IN/readiness?operation=LOAD&wcsOrderId=WCS-20260903-000001",
+      "request": "GET /api/v1/rb/stations/CV02_OUT/readiness?operation=LOAD&wcsOrderId=WCS-20260903-000001",
       "note": "2초 후 재확인. READY이므로 파지를 시작합니다.",
-      "response": { "http": 200, "body": { "stationId": "CV02_IN", "operation": "LOAD", "status": "READY", "ready": true, "reasonCode": null, "updatedAt": "2026-09-03T05:00:02.500Z" } }
+      "response": { "http": 200, "body": { "stationId": "CV02_OUT", "operation": "LOAD", "status": "READY", "ready": true, "reasonCode": null, "updatedAt": "2026-09-03T05:00:02.500Z" } }
     },
     {
       "step": 7,
       "direction": "RB-Y1 → WCS",
       "request": "POST /api/v1/rb/transport-events",
       "note": "To 도착 보고 (이송·AR 정렬 완료, 배치 직전).",
-      "body": { "eventId": "7a91…", "wcsOrderId": "WCS-20260903-000001", "eventType": "ARRIVED_AT_TO", "robotSerial": "RBY1-001", "nodeId": "RACK01_PORT01", "result": "SUCCESS", "message": null, "occurredAt": "2026-09-03T05:01:30.000Z" },
+      "body": { "eventId": "7a91…", "wcsOrderId": "WCS-20260903-000001", "eventType": "ARRIVED_AT_TO", "robotSerial": "RBY1-001", "nodeId": "RACK01_PORT02", "result": "SUCCESS", "message": null, "occurredAt": "2026-09-03T05:01:30.000Z" },
       "response": { "http": 200, "body": { "accepted": true, "eventId": "7a91…", "receivedAt": "2026-09-03T05:01:30.050Z" } }
     },
     {
       "step": 8,
       "direction": "RB-Y1 → WCS",
-      "request": "GET /api/v1/rb/stations/RACK01_PORT01/readiness?operation=UNLOAD&wcsOrderId=WCS-20260903-000001",
+      "request": "GET /api/v1/rb/stations/RACK01_PORT02/readiness?operation=UNLOAD&wcsOrderId=WCS-20260903-000001",
       "note": "언로딩(배치) 시작 가능 여부 확인. READY이므로 배치를 시작합니다.",
-      "response": { "http": 200, "body": { "stationId": "RACK01_PORT01", "operation": "UNLOAD", "status": "READY", "ready": true, "reasonCode": null, "updatedAt": "2026-09-03T05:01:00.000Z" } }
+      "response": { "http": 200, "body": { "stationId": "RACK01_PORT02", "operation": "UNLOAD", "status": "READY", "ready": true, "reasonCode": null, "updatedAt": "2026-09-03T05:01:00.000Z" } }
     },
     {
       "step": 9,

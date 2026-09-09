@@ -67,7 +67,7 @@ BEFORE_LEFT = np.deg2rad([-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]).to
 
 GRASP_RIGHT = np.deg2rad([-28.592, -28.537, -30.579, -80.469, -63.332, 91.746, -7.972]).tolist()
 GRASP_LEFT = np.deg2rad([-28.592, 28.537, 30.579, -80.469, 63.332, 91.746, 7.972]).tolist()
-GRASP_TORSO = np.deg2rad([0.02, 33.00, -52.01, 40.00, 0.05, 0.01]).tolist()
+GRASP_TORSO = np.deg2rad([0.020, 34.030, -53.957, 40.917, 0.050, 0.010]).tolist()
 
 UP_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
 UP_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
@@ -471,12 +471,12 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
         raise RuntimeError("이송 direct target 주행 실패")
 
     check_cancel()  # AR 정렬 전
+    wait_ready("UNLOAD")  # WCS 도착 보고 + 언로딩 가능 확인 (READY까지 대기)
     print("AR 마커 one-shot 정렬")
     if not ar_aligner.align(robot, monitor):
         raise RuntimeError("AR 마커 정렬 실패")
 
     check_cancel()  # 배치 전
-    wait_ready("UNLOAD")  # WCS 도착 보고 + 언로딩 가능 확인 (READY까지 대기)
     if not lower_release_and_retract(robot, gripper):
         raise RuntimeError("Tote 배치 실패")
 
