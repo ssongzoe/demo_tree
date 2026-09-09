@@ -1,4 +1,4 @@
-"""SFA WCS health 확인과 RBY1 status POST를 담당하는 HTTP 클라이언트."""
+"""SFA WCS health 확인, RBY1 status POST, transport-event 콜백, PIO readiness 조회 HTTP 클라이언트."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ class WcsClient:
         dry_run: bool = False,
         session: requests.Session | None = None,
         transport_event_path: str | None = None,
+        readiness_path: str | None = None,
     ) -> None:
         if not base_url.strip():
             raise ValueError("WCS base_url이 비어 있습니다.")
@@ -38,6 +39,8 @@ class WcsClient:
         self._status_error_logged = False
         self._transport_event_path = transport_event_path
         self._event_error_logged = False
+        self._readiness_path = readiness_path
+        self._readiness_error_logged = False
         self._owns_session = session is None
         self._session = session or requests.Session()
         self._session.headers.update({"Content-Type": "application/json; charset=utf-8"})
@@ -133,6 +136,49 @@ class WcsClient:
                  response.status_code, response.text.strip()[:120])
         return True
 
+    def get_readiness(self, station_id: str, operation: str,
+                      wcs_order_id: str | None) -> dict[str, Any] | None:
+        """PIO readiness 조회 (v07.4 9.2). GET .../stations/{stationId}/readiness?operation=&wcsOrderId=
+
+        200 + JSON object면 body를 그대로 돌려준다({status: READY|NOT_READY, ready: bool, reasonCode, ...}).
+        네트워크 오류, 비 2xx, JSON 아님이면 None(UNKNOWN) — 호출부가 NOT_READY처럼 재확인한다.
+        """
+        if self._readiness_path is None:
+            log.warning("readiness_path가 설정되지 않아 READY로 간주합니다.")
+            return {"status": "READY", "ready": True}
+
+        url = self._join_url(self._readiness_path.format(stationId=quote(station_id, safe="")))
+        params = {"operation": operation, "wcsOrderId": wcs_order_id or ""}
+        if self._dry_run:
+            log.info("[DRY_RUN] GET %s %s -> READY", url, params)
+            return {"stationId": station_id, "operation": operation, "status": "READY", "ready": True,
+                    "reasonCode": None}
+
+        try:
+            response = self._session.get(url, params=params, timeout=self._timeout)
+        except requests.RequestException as error:
+            self._log_readiness_error("WCS readiness GET 실패 (%s): %s — %s를 NOT_READY로 보고 재확인합니다.",
+                                      url, error, operation)
+            return None
+
+        if not 200 <= response.status_code < 300:
+            self._log_readiness_error("WCS readiness GET -> HTTP %s: %s", response.status_code,
+                                      response.text.strip()[:160])
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            self._log_readiness_error("WCS readiness 응답이 JSON이 아닙니다: %r", response.text.strip()[:160])
+            return None
+        if not isinstance(body, dict):
+            self._log_readiness_error("WCS readiness 응답이 object가 아닙니다: %r", body)
+            return None
+
+        if self._readiness_error_logged:
+            log.info("WCS readiness GET 복구 -> HTTP %s %s", response.status_code, response.text.strip()[:120])
+            self._readiness_error_logged = False
+        return body
+
     def close(self) -> None:
         if self._owns_session:
             self._session.close()
@@ -141,6 +187,14 @@ class WcsClient:
         if not self._status_error_logged:
             log.warning(message, *args)
             self._status_error_logged = True
+        else:
+            log.debug(message, *args)
+
+    def _log_readiness_error(self, message: str, *args: Any) -> None:
+        # 2초 polling이라 같은 오류가 반복되면 첫 1회만 경고로 남긴다.
+        if not self._readiness_error_logged:
+            log.warning(message, *args)
+            self._readiness_error_logged = True
         else:
             log.debug(message, *args)
 

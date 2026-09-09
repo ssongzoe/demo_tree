@@ -21,9 +21,14 @@
     },
     "eventType": {
       "type": "string",
-      "enum": ["COMPLETED", "FAILED", "CANCELED"],
-      "description": "RB-Y1은 최종 결과 3종만 보고합니다. CANCELED는 취소 요청(4.8) 접수 후 안전 정지를 마친 시점에 전송됩니다.",
-      "examples": ["COMPLETED"]
+      "enum": ["ARRIVED_AT_FROM", "ARRIVED_AT_TO", "COMPLETED", "FAILED", "CANCELED"],
+      "description": "도착 보고 2종 + 최종 결과 3종. ARRIVED_AT_FROM은 파지(로딩) 직전, ARRIVED_AT_TO는 배치(언로딩) 직전에 보내며, 그 직후 PIO readiness(9장)를 GET으로 확인합니다. CANCELED는 취소 요청(4.8) 접수 후 안전 정지를 마친 시점에 전송됩니다.",
+      "examples": ["ARRIVED_AT_FROM", "COMPLETED"]
+    },
+    "nodeId": {
+      "type": ["string", "null"],
+      "description": "도착 보고(ARRIVED_AT_*)에서 도착한 위치. RB 토폴로지 nodeId가 확정되기 전까지 오더의 fromStationId/toStationId 값을 그대로 넣습니다(규격서 8.2). 최종 결과 이벤트에는 넣지 않습니다.",
+      "examples": ["RACK01_PORT01", "CV02_IN"]
     },
     "robotSerial": {
       "type": "string",
@@ -33,14 +38,14 @@
     "result": {
       "type": "string",
       "enum": ["SUCCESS", "FAILED"],
-      "description": "eventType 과 대응합니다. COMPLETED/CANCELED → SUCCESS, FAILED → FAILED.",
+      "description": "eventType 과 대응합니다. ARRIVED_AT_*/COMPLETED/CANCELED → SUCCESS, FAILED → FAILED.",
       "examples": ["SUCCESS"]
     },
     "message": {
       "type": ["string", "null"],
       "maxLength": 200,
       "description": "실패 사유.  성공 시에는 null 입니다. 같은 내용이 상태 업로드의 robot_state.error_message 로도 전송됩니다.",
-      "examples": [null, "Tote 인식 / 정렬 / 파지 실패"]
+      "examples": [null, "Tote 인식 / 정렬 / 파지 실패", "PIO_NOT_READY_TIMEOUT: UNLOAD CV02_IN 120s (reasonCode=CONVEYOR_FULL)"]
     },
     "occurredAt": {
       "type": "string",

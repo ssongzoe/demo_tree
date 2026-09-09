@@ -13,6 +13,8 @@
 9. 각 사이클은 WCS가 로봇 측 오더 서버(:5225)에 POST한 반송 오더를 받은 뒤 시작하고, 완료/실패를 WCS에 콜백한다
    (AMR Transport Order 규격 준용). --no-wcs-order 이면 기존처럼 연속 반복
 10. WCS가 취소(POST .../{wcsOrderId}/cancel)를 보내면 단계 경계(안전 지점)에서 정지하고 CANCELED를 콜백한다.
+11. 파지 전/배치 전에 WCS에 도착 보고(ARRIVED_AT_FROM/ARRIVED_AT_TO)를 보내고, PIO readiness(v07.4 9장)를
+    GET으로 확인해 READY일 때만 로딩/언로딩을 시작한다. NOT_READY면 2초마다 재확인, 120초 초과 시 FAILED.
     모션 도중에는 끊지 않으므로 토트를 든 채 정지할 수 있으며, 이후 복구는 운영자가 수행한다
 
 이동 거리와 회전각은 아래 target 상수만 수정하면 되며, 실행 로그는 target 값을 직접 읽어 출력하므로 값과 설명이 따로 어긋나지 않는다.
@@ -26,7 +28,7 @@ from concurrent.futures import Future
 
 import numpy as np
 
-from communication.wcs.publisher import OrderCanceled, WcsPublisher
+from communication.wcs.publisher import OrderCanceled, ReadinessTimeout, WcsPublisher
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_arms_through_waypoint, move_torso_and_head
@@ -438,16 +440,20 @@ def run_return_route(robot, monitor) -> bool:
 
 
 def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_index: int,
-              cancel_check=None) -> None:
+              cancel_check=None, readiness_wait=None) -> None:
     """박스 인식/파지부터 이송, AR 정렬, 배치, 복귀까지 한 사이클을 수행하며 완료 후 다음 사이클을 같은 위치에서 시작한다.
 
     cancel_check는 WCS 취소 요청 확인용 콜백이다. 모션 도중이 아니라 단계 경계(안전 지점)에서만
     호출하므로, 취소 시 로봇은 마지막으로 완료한 단계의 자세에서 정지한다. 이후 복구는 운영자가 수행한다.
+    readiness_wait(operation)은 WCS PIO readiness 확인용 콜백이다. 파지 전 "LOAD", 배치 전 "UNLOAD"로 호출하며
+    READY가 될 때까지 블록한다(대기 중 취소 요청은 OrderCanceled, 최대 대기 초과는 ReadinessTimeout).
     """
     check_cancel = cancel_check or (lambda: None)
+    wait_ready = readiness_wait or (lambda operation: None)
 
     print(f"\n{'=' * 24} CYCLE {cycle_index} START {'=' * 24}")
     check_cancel()  # 파지 전
+    wait_ready("LOAD")  # WCS 도착 보고 + 로딩 가능 확인 (READY까지 대기)
     print(f"박스 파지 시작")
     if not detect_grasp_and_lift(
         robot,
@@ -470,6 +476,7 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
         raise RuntimeError("AR 마커 정렬 실패")
 
     check_cancel()  # 배치 전
+    wait_ready("UNLOAD")  # WCS 도착 보고 + 언로딩 가능 확인 (READY까지 대기)
     if not lower_release_and_retract(robot, gripper):
         raise RuntimeError("Tote 배치 실패")
 
@@ -488,6 +495,18 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
 # ------------------------------------------------------------------
 #    ##############            Main           #################
 # ------------------------------------------------------------------
+
+
+def _make_readiness_wait(wcs_publisher: WcsPublisher):
+    """파지/배치 전 호출: 도착 보고(ARRIVED_AT_FROM/TO) 후 PIO readiness READY까지 대기한다."""
+    where = {"LOAD": "FROM", "UNLOAD": "TO"}
+
+    def wait(operation: str) -> None:
+        wcs_publisher.report_arrival(where[operation])  # 실패해도 publisher 큐가 재시도한다
+        print(f"WCS {operation} readiness 확인 중...")
+        wcs_publisher.wait_until_ready(operation)
+
+    return wait
 
 
 def main() -> None:
@@ -572,7 +591,9 @@ def main() -> None:
             try:
                 run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_index,
                           cancel_check=None if args.no_wcs_order
-                          else wcs_publisher.raise_if_cancel_requested)
+                          else wcs_publisher.raise_if_cancel_requested,
+                          readiness_wait=None if args.no_wcs_order
+                          else _make_readiness_wait(wcs_publisher))
             except OrderCanceled as cancel:
                 # 단계 경계에서 안전 정지한 상태. CANCELED를 보고하고 다음 오더를 기다린다.
                 # 토트를 든 채 정지했을 수 있으며, 이후 복구는 운영자가 수행한다 (v07.3 4.8).
@@ -594,6 +615,12 @@ def main() -> None:
         wcs_publisher.set_work_state("IDLE")
         wcs_publisher.fail_order("사용자가 데모를 중단했습니다")  # 진행 중 오더가 없으면 no-op
         print(f"\n사용자가 반복 데모를 중단했습니다. 완료 사이클: {completed_cycles}")
+
+    except ReadinessTimeout as error:
+        # WCS 설비가 제한 시간 안에 READY가 되지 않았다. 로봇은 단계 경계에서 정지한 상태다 (T-04).
+        wcs_publisher.set_work_state("ERROR", str(error))
+        wcs_publisher.fail_order(str(error))
+        print(f"WCS PIO readiness 대기 초과로 중단: {error} | 완료 사이클: {completed_cycles}")
 
     except Exception as error:
         wcs_publisher.set_work_state("ERROR", str(error))

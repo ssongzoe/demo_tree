@@ -20,6 +20,9 @@ WCS가 로봇 측 오더 서버에 오더를 POST(push)하고, 로봇이 완료/
 
 로봇 → WCS (실 WCS 호환):
     GET  /health                                    -> "healthy"
+    GET  /api/v1/rb/stations/{stationId}/readiness?operation=LOAD|UNLOAD&wcsOrderId=
+                                                    -> 200 {stationId, operation, status: READY|NOT_READY, ready, reasonCode, updatedAt}
+                                                       (v07.4 9장 Application PIO. 기본 READY, 대시보드/POST /api/test/readiness로 변경)
     POST /api/v1/rb/rby1/status                     -> 201 {"accepted": true, "recordId": ...}
     POST /api/v1/rb/transport-events                -> 200 {"accepted": true, "eventId": ..., "receivedAt": ...}
     GET  /api/v1/rb/rby1/status/{serial}/latest | /history?limit=N
@@ -29,6 +32,7 @@ WCS → 로봇 (이 서버가 호출):
 테스트 전용:
     POST /api/test/order   {wcsOrderId?, carrierId?, fromStationId?, toStationId?, priority?}  수동 발행
     POST /api/test/auto    {"enabled": true|false}                                             자동 발행 토글
+    POST /api/test/readiness {stationId, operation, status: READY|NOT_READY, reasonCode?}      PIO readiness 설정
     POST /api/test/resume, POST /api/test/cancel, GET /api/test/state, GET /  (대시보드)
 """
 from __future__ import annotations
@@ -47,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-PORT = int(os.getenv("FAKE_WCS_PORT", "5224"))
+PORT = int(os.getenv("FAKE_WCS_PORT", "5226"))
 BIND = os.getenv("FAKE_WCS_BIND", "0.0.0.0")
 COOLDOWN_SEC = float(os.getenv("FAKE_WCS_COOLDOWN_SEC", "15"))
 ROBOT_URL = os.getenv("FAKE_WCS_ROBOT_URL", "http://127.0.0.1:5225").rstrip("/")
@@ -65,6 +69,9 @@ BUSY = -1  # _dispatch: 다른 발행이 진행 중이라 건너뜀
 
 STATUS_PREFIX = "/api/v1/rb/rby1/status"
 EVENT_PATH = "/api/v1/rb/transport-events"
+STATIONS_PREFIX = "/api/v1/rb/stations"
+READINESS_OPERATIONS = ("LOAD", "UNLOAD")
+ARRIVAL_EVENTS = ("ARRIVED_AT_FROM", "ARRIVED_AT_TO")
 
 log = logging.getLogger("fake-wcs")
 
@@ -97,6 +104,10 @@ class WcsSimulator:
         self._event_log: deque[dict[str, Any]] = deque(maxlen=LOG_MAX)
         # 통신 로그: 보낸 오더/취소 요청과 로봇 응답, 로봇이 보낸 이벤트와 우리 응답 (원본 그대로)
         self._comm_log: deque[dict[str, Any]] = deque(maxlen=LOG_MAX)
+        # PIO readiness (v07.4 9장). key "stationId:OPERATION". 항목이 없으면 READY.
+        self._readiness: dict[str, dict[str, Any]] = {}
+        # 로봇이 지금 무엇을 묻고 있는지 (대시보드 표시용). key 동일.
+        self._readiness_polls: dict[str, dict[str, Any]] = {}
         self._seen_event_ids: dict[str, str] = {}
         self._received = 0
 
@@ -162,6 +173,51 @@ class WcsSimulator:
                  "wcsOrderId": order_id, "request": request, "httpCode": code, "response": response}
         with self._lock:
             self._comm_log.appendleft(entry)
+
+    # ── PIO readiness (v07.4 9장) ───────────────────────────────
+    @staticmethod
+    def _readiness_key(station_id: str, operation: str) -> str:
+        return f"{station_id}:{operation.upper()}"
+
+    def set_readiness(self, station_id: str, operation: str, status: str,
+                      reason_code: str | None) -> dict[str, Any]:
+        """대시보드/curl로 설비 준비 상태를 바꾼다."""
+        entry = {"stationId": station_id, "operation": operation.upper(), "status": status.upper(),
+                 "reasonCode": (reason_code or None) if status.upper() != "READY" else None,
+                 "updatedAt": _now_iso()}
+        with self._lock:
+            self._readiness[self._readiness_key(station_id, operation)] = entry
+        log.info("readiness 설정: %s %s -> %s (reasonCode=%s)", station_id, operation.upper(),
+                 entry["status"], entry["reasonCode"])
+        return dict(entry)
+
+    def get_readiness(self, station_id: str, operation: str, wcs_order_id: str | None) -> dict[str, Any]:
+        """로봇의 readiness 조회 응답. 통신 로그에는 첫 조회와 status가 바뀐 조회만 남긴다."""
+        operation = operation.upper()
+        key = self._readiness_key(station_id, operation)
+        with self._lock:
+            entry = self._readiness.get(key)
+            body = {"stationId": station_id, "operation": operation,
+                    "status": entry["status"] if entry else "READY",
+                    "ready": (entry["status"] == "READY") if entry else True,
+                    "reasonCode": entry["reasonCode"] if entry else None,
+                    "updatedAt": entry["updatedAt"] if entry else _now_iso()}
+            poll = self._readiness_polls.get(key)
+            first_or_changed = poll is None or poll.get("lastStatus") != body["status"] \
+                or poll.get("wcsOrderId") != wcs_order_id
+            if first_or_changed:
+                poll = {"count": 0, "firstAt": _now_iso()}
+                self._readiness_polls[key] = poll
+            poll.update({"count": poll["count"] + 1, "lastAt": _now_iso(), "wcsOrderId": wcs_order_id,
+                         "lastStatus": body["status"], "stationId": station_id, "operation": operation})
+        if first_or_changed:
+            log.info("readiness 조회: %s %s (order=%s) -> %s%s", station_id, operation, wcs_order_id, body["status"],
+                     "" if body["ready"] else f" (reasonCode={body['reasonCode']}) — 로봇이 재확인 중")
+            self._record_comm("로봇→WCS", f"readiness {operation}",
+                              f"GET {STATIONS_PREFIX}/{station_id}/readiness?operation={operation}&wcsOrderId={wcs_order_id}",
+                              {"stationId": station_id, "operation": operation, "wcsOrderId": wcs_order_id},
+                              200, body, wcs_order_id)
+        return body
 
     def cancel_current(self) -> tuple[bool, str]:
         """진행 중 오더의 취소를 로봇에 요청한다 (v07.3 4.8). 대시보드 [취소] 버튼용."""
@@ -281,8 +337,9 @@ class WcsSimulator:
             order_id = str(event.get("wcsOrderId") or "")
             event_type = str(event.get("eventType") or "").upper()
             current_id = self._current_order["wcsOrderId"] if self._current_order else None
-            log.info("transport-event 수신: %s %s result=%s message=%r", event_type, order_id,
-                     event.get("result"), event.get("message"))
+            log.info("transport-event 수신: %s %s result=%s message=%r%s", event_type, order_id,
+                     event.get("result"), event.get("message"),
+                     f" nodeId={event.get('nodeId')} (도착 보고 — 상태 전이 없음)" if event_type in ARRIVAL_EVENTS else "")
 
             if order_id != current_id:
                 log.warning("현재 오더(%s)가 아닌 이벤트: %s — 상태 전이 없음", current_id, order_id)
@@ -359,6 +416,8 @@ class WcsSimulator:
                 "orderLog": list(self._order_log),
                 "eventLog": list(self._event_log),
                 "commLog": list(self._comm_log),
+                "readiness": list(self._readiness.values()),
+                "readinessPolls": list(self._readiness_polls.values()),
                 "received": self._received,
                 "latest": {serial: dict(records[0]) for serial, records in self._history.items() if records},
                 "serverTime": _now_iso(),
@@ -449,6 +508,12 @@ PAGE = """<!doctype html>
   .toggle { display:flex; align-items:center; gap:6px; margin-bottom:8px; cursor:pointer; }
   .toggle input { width:16px; height:16px; accent-color:var(--ok); }
   #orderMsg { min-height:1.5em; margin-top:8px; font-size:12px; word-break:break-all; }
+  .rd { display:grid; grid-template-columns:auto 1fr 1fr; gap:6px 10px; align-items:center; font-size:12px; }
+  .rd .st { font-weight:700; font-variant-numeric:tabular-nums; }
+  .rd .op { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .rd .op button { padding:3px 8px; font-size:11px; }
+  .rd .op button.off { background:#000; color:var(--dim); border:1px solid var(--line); }
+  .rd .poll { font-size:11px; color:var(--warn); }
   .comm { display:flex; flex-direction:column; gap:10px; max-height:640px; overflow:auto; }
   .comm .entry { border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
   .comm .head { display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:12px;
@@ -484,6 +549,12 @@ PAGE = """<!doctype html>
       <button id="btnResume" onclick="resume()" disabled>재개</button>
     </div>
     <div id="orderMsg" class="dim"></div>
+  </div>
+  <div class="card form"><h2>PIO Readiness (v07.4 9장, 로봇 → WCS GET)</h2>
+    <div class="dim" style="font-size:12px;margin-bottom:8px">로봇은 파지 전 LOAD(from), 배치 전 UNLOAD(to)를 묻고 READY일 때만 진행. NOT_READY면 2초마다 재확인, 최대 대기 초과 시 FAILED.</div>
+    <div id="readiness"></div>
+    <div class="row" style="border:0;margin-top:6px"><span class="k">stationId 추가</span><input type="text" id="r_station" placeholder="예: CV03_IN"><button onclick="addStation()" style="margin-left:8px">추가</button></div>
+    <div id="readyMsg" class="dim" style="min-height:1.5em;margin-top:6px;font-size:12px"></div>
   </div>
   <div class="card"><h2>로봇 상태</h2><div class="tiles" id="state"></div></div>
   <div class="card"><h2>배터리</h2><div id="batt"></div></div>
@@ -582,6 +653,52 @@ function renderComm(list) {
   }).join("") + `</div>`;
 }
 
+const extraStations = new Set();
+function addStation() {
+  const v = $("r_station").value.trim();
+  if (v) { extraStations.add(v); $("r_station").value = ""; commKey = ""; readyKey = ""; tick(); }
+}
+async function setReadiness(station, op, status) {
+  const reason = status === "NOT_READY" ? (prompt(`${station} ${op} reasonCode (선택, 비워도 됨)`, "") || null) : null;
+  const b = await post("/api/test/readiness", {stationId: station, operation: op, status, reasonCode: reason});
+  const m = $("readyMsg"); m.textContent = b.ok ? `${station} ${op} → ${status}${reason ? " (" + reason + ")" : ""}` : b.message;
+  m.className = b.ok ? (status === "READY" ? "ok" : "warn") : "bad";
+  readyKey = ""; tick();
+}
+let readyKey = "";
+function renderReadiness(s) {
+  const map = {};
+  for (const r of s.readiness) map[`${r.stationId}:${r.operation}`] = r;
+  const polls = {};
+  for (const p of s.readinessPolls) polls[`${p.stationId}:${p.operation}`] = p;
+  const stations = new Set([s.fromStation, s.toStation, ...extraStations]);
+  if (s.currentOrder) { if (s.currentOrder.fromStationId) stations.add(s.currentOrder.fromStationId);
+                        if (s.currentOrder.toStationId) stations.add(s.currentOrder.toStationId); }
+  for (const r of s.readiness) stations.add(r.stationId);
+  for (const p of s.readinessPolls) stations.add(p.stationId);
+  const now = Date.now();
+  const key = JSON.stringify([...stations, s.readiness, s.readinessPolls.map(p => [p.stationId, p.operation, p.count, p.lastStatus])]);
+  if (key === readyKey) return;
+  readyKey = key;
+  let h = `<div class="rd"><span class="dim">station</span><span class="dim">LOAD (파지 전)</span><span class="dim">UNLOAD (배치 전)</span>`;
+  for (const st of stations) {
+    h += `<span class="st">${st}</span>`;
+    for (const op of ["LOAD", "UNLOAD"]) {
+      const r = map[`${st}:${op}`]; const status = r ? r.status : "READY";
+      const p = polls[`${st}:${op}`];
+      const polling = p && (now - new Date(p.lastAt).getTime()) < 6000 && p.lastStatus !== "READY";
+      h += `<span class="op">
+        <button class="${status==='READY'?'okbtn':'off'}" onclick="setReadiness('${st}','${op}','READY')">READY</button>
+        <button class="${status==='NOT_READY'?'danger':'off'}" onclick="setReadiness('${st}','${op}','NOT_READY')">NOT_READY</button>
+        ${r && r.reasonCode ? `<span class="dim">${r.reasonCode}</span>` : ""}
+        ${polling ? `<span class="poll">⏳ 로봇 대기 중 · ${p.count}회 · ${ts(p.lastAt)}</span>` :
+          p ? `<span class="dim" style="font-size:11px">마지막 조회 ${ts(p.lastAt)} → ${p.lastStatus}</span>` : ""}
+      </span>`;
+    }
+  }
+  $("readiness").innerHTML = h + `</div>`;
+}
+
 function syncForm(s) {
   if (!formInit) {
     $("f_fromStationId").value = s.fromStation;
@@ -632,6 +749,12 @@ async function tick() {
   document.getElementById("banner").innerHTML = b;
 
   syncForm(s);
+  renderReadiness(s);
+  const waiting = s.readinessPolls.filter(p => p.lastStatus !== "READY" && (Date.now() - new Date(p.lastAt).getTime()) < 6000);
+  if (waiting.length) {
+    document.getElementById("banner").innerHTML += waiting.map(p =>
+      `<div class="banner warn">로봇이 ${p.stationId} ${p.operation} readiness를 기다리는 중 (${p.count}회 조회, ${p.lastStatus}) — PIO 카드에서 READY로 바꾸면 진행</div>`).join("");
+  }
   const o = s.currentOrder;
   document.getElementById("server").innerHTML =
     `<div class="big ${STATE_CLS[s.serverState] || ''}">${s.serverState}</div>
@@ -651,7 +774,7 @@ async function tick() {
 
   document.getElementById("eventlog").innerHTML = s.eventLog.length
     ? `<table><tr><th>wcsOrderId</th><th>type</th><th>result</th><th>message</th><th>수신</th></tr>` +
-      s.eventLog.map(e => `<tr><td>${e.wcsOrderId ?? ""}</td><td class="${e.eventType==='FAILED'?'bad':e.eventType==='COMPLETED'?'ok':''}">${e.eventType ?? ""}</td><td>${e.result ?? ""}</td><td style="text-align:left">${e.message ?? ""}</td><td>${ts(e.receivedAt)}</td></tr>`).join("") + `</table>`
+      s.eventLog.map(e => `<tr><td>${e.wcsOrderId ?? ""}</td><td class="${e.eventType==='FAILED'?'bad':e.eventType==='COMPLETED'?'ok':/^ARRIVED/.test(e.eventType)?'info':''}">${e.eventType ?? ""}</td><td>${e.result ?? ""}</td><td style="text-align:left">${e.message ?? ""}</td><td>${ts(e.receivedAt)}</td></tr>`).join("") + `</table>`
     : `<div class="dim">아직 수신한 이벤트 없음</div>`;
 
   renderComm(s.commLog);
@@ -721,6 +844,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/test/state":
             return self._json(200, SIM.dashboard_state())
 
+        if path.startswith(STATIONS_PREFIX + "/"):
+            parts = path[len(STATIONS_PREFIX) + 1:].strip("/").split("/")
+            if len(parts) == 2 and parts[1] == "readiness":
+                query = parse_qs(url.query)
+                operation = (query.get("operation", [""])[0] or "").strip().upper()
+                if operation not in READINESS_OPERATIONS:
+                    return self._json(400, {"errorCode": "INVALID_REQUEST",
+                                            "message": f"operation must be one of {', '.join(READINESS_OPERATIONS)}",
+                                            "timestamp": _now_iso()})
+                order_id = (query.get("wcsOrderId", [""])[0] or "").strip() or None
+                return self._json(200, SIM.get_readiness(unquote(parts[0]), operation, order_id))
+
         if path.startswith(STATUS_PREFIX + "/"):
             parts = path[len(STATUS_PREFIX) + 1:].strip("/").split("/")
             if len(parts) == 2:
@@ -749,7 +884,7 @@ class Handler(BaseHTTPRequestHandler):
                               {"ok": ok, "message": message,
                                "serverState": SIM.dashboard_state()["serverState"]})
 
-        if path in ("/api/test/order", "/api/test/auto"):
+        if path in ("/api/test/order", "/api/test/auto", "/api/test/readiness"):
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length).decode("utf-8") if length else ""
             try:
@@ -761,6 +896,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/test/auto":
                 enabled = SIM.set_auto(bool(fields.get("enabled")))
                 return self._json(200, {"ok": True, "autoDispatch": enabled})
+            if path == "/api/test/readiness":
+                station = str(fields.get("stationId") or "").strip()
+                operation = str(fields.get("operation") or "").strip().upper()
+                status = str(fields.get("status") or "").strip().upper()
+                if not station or operation not in READINESS_OPERATIONS or status not in ("READY", "NOT_READY"):
+                    return self._json(400, {"ok": False, "message": "stationId, operation(LOAD|UNLOAD), "
+                                                                    "status(READY|NOT_READY) 필요"})
+                entry = SIM.set_readiness(station, operation, status, fields.get("reasonCode"))
+                return self._json(200, {"ok": True, "readiness": entry})
             ok, message, code = SIM.dispatch_manual(fields)
             state = SIM.dashboard_state()
             return self._json(code, {"ok": ok, "message": message,

@@ -5,8 +5,10 @@
     DRY_RUN=0 python tools/fake_wcs/sim_robot.py --error "테스트 오류"    # 첫 오더를 FAILED로 끝내고 종료
 
 데모(demo_full_sequence_loop.py)와 같은 통신 모듈(communication.wcs)을 그대로 쓴다:
-IDLE(하트비트) → WCS 반송 오더 수신(POST :5225) → WORKING(work-sec) → DONE + COMPLETED 콜백 → IDLE … 반복.
+IDLE(하트비트) → WCS 반송 오더 수신(POST :5225) → ARRIVED_AT_FROM + LOAD readiness 대기 → WORKING(work-sec/2)
+→ ARRIVED_AT_TO + UNLOAD readiness 대기 → WORKING(work-sec/2) → DONE + COMPLETED 콜백 → IDLE … 반복.
 WORKING 중 취소(POST .../{wcsOrderId}/cancel)가 오면 중단하고 CANCELED 콜백을 보낸다.
+readiness가 최대 대기(READINESS_MAX_WAIT_SEC) 안에 READY가 안 되면 FAILED(PIO_NOT_READY_TIMEOUT)를 보고한다.
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ from types import SimpleNamespace
 # 리포 루트를 import 경로에 추가 (tools/fake_wcs/ 에서 실행해도 communication.wcs를 찾도록)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from communication.wcs.publisher import WcsPublisher  # noqa: E402
+from communication.wcs.publisher import OrderCanceled, WcsPublisher  # noqa: E402
 
 # Model M 26 DOF 파트 인덱스 (rby1-sdk Model_M 순서)
 _MODEL = SimpleNamespace(
@@ -86,14 +88,27 @@ def main() -> int:
             log.info("사이클 %d 시작: %s (%s -> %s)", cycle, order["wcsOrderId"],
                      order.get("fromStationId"), order.get("toStationId"))
             publisher.set_work_state("WORKING")
-            # 데모의 단계 경계 취소 확인을 흉내내 0.2초 간격으로 취소 요청을 확인한다.
-            canceled = False
-            work_end = time.monotonic() + args.work_sec
-            while time.monotonic() < work_end:
-                if publisher.cancel_requested() is not None:
-                    canceled = True
-                    break
-                time.sleep(0.2)
+
+            def work(seconds: float) -> bool:
+                """데모의 단계 경계 취소 확인을 흉내내 0.2초 간격으로 취소 요청을 확인한다. 취소면 False."""
+                end = time.monotonic() + seconds
+                while time.monotonic() < end:
+                    if publisher.cancel_requested() is not None:
+                        return False
+                    time.sleep(0.2)
+                return True
+
+            try:
+                # 데모와 같은 순서: 도착 보고 → readiness READY 대기 → (파지·이송) → 도착 보고 → readiness → (배치·복귀)
+                publisher.report_arrival("FROM")
+                publisher.wait_until_ready("LOAD")
+                canceled = not work(args.work_sec / 2)
+                if not canceled:
+                    publisher.report_arrival("TO")
+                    publisher.wait_until_ready("UNLOAD")
+                    canceled = not work(args.work_sec / 2)
+            except OrderCanceled:
+                canceled = True
             if canceled:
                 log.info("사이클 %d 취소됨 (WCS 취소 요청)", cycle)
                 publisher.set_work_state("IDLE")

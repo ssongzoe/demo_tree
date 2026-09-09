@@ -24,8 +24,26 @@ PENDING_EVENT_MAXLEN = 10   # 미전송 transport-event (COMPLETED/FAILED/CANCEL
 WORK_EVENT_MAXLEN = 10      # 미전송 work_cycle 전환
 
 
+FINAL_EVENT_TYPES = ("COMPLETED", "FAILED", "CANCELED")
+ARRIVAL_EVENT_TYPES = {"FROM": "ARRIVED_AT_FROM", "TO": "ARRIVED_AT_TO"}
+READINESS_STATION_FIELD = {"LOAD": "fromStationId", "UNLOAD": "toStationId"}
+
+
 class OrderCanceled(RuntimeError):
     """WCS가 현재 진행 중인 오더의 취소를 요청했다. 작업 실행부가 안전 지점에서 raise한다."""
+
+
+class ReadinessTimeout(RuntimeError):
+    """PIO readiness가 최대 대기 시간 안에 READY가 되지 않았다 (v07.4 9.3, T-04 PIO_NOT_READY_TIMEOUT)."""
+
+    def __init__(self, station_id: str, operation: str, waited_sec: float,
+                 last_reason_code: str | None) -> None:
+        self.station_id = station_id
+        self.operation = operation
+        self.waited_sec = waited_sec
+        self.last_reason_code = last_reason_code
+        super().__init__(f"PIO_NOT_READY_TIMEOUT: {operation} {station_id} {waited_sec:.0f}s "
+                         f"(reasonCode={last_reason_code})")
 
 
 class WcsPublisher:
@@ -54,6 +72,7 @@ class WcsPublisher:
             config.HTTP_TIMEOUT_SEC,
             dry_run=dry_run,
             transport_event_path=config.WCS_TRANSPORT_EVENT_PATH,
+            readiness_path=config.WCS_READINESS_PATH,
         )
         # WCS → 로봇 반송 오더 수신 (AMR Transport Order 규격 준용). DRY_RUN이면 띄우지 않는다.
         self._order_receiver = OrderReceiver(config.ROBOT_ORDER_BIND, config.ROBOT_ORDER_PORT,
@@ -233,6 +252,83 @@ class WcsPublisher:
         """안전 정지 완료 후 현재 오더를 CANCELED로 WCS에 보고한다."""
         return self._report_order_event("CANCELED", "SUCCESS", None)
 
+    # ── 도착 보고 + PIO readiness (v07.4 2장 시나리오 3/5, 9장) ─────────────
+    def report_arrival(self, where: str) -> bool:
+        """현재 오더의 From/To 도착을 WCS에 보고한다 (ARRIVED_AT_FROM / ARRIVED_AT_TO). 오더는 계속 진행 중."""
+        event_type = ARRIVAL_EVENT_TYPES[where.upper()]
+        order = self._current_order
+        if order is None:
+            log.debug("보고할 진행 중 오더가 없습니다 (%s)", event_type)
+            return False
+        station_field = "fromStationId" if where.upper() == "FROM" else "toStationId"
+        return self._send_event(str(order["wcsOrderId"]), event_type, "SUCCESS", None,
+                                node_id=order.get(station_field))
+
+    def wait_until_ready(self, operation: str, *, poll_sec: float = config.READINESS_POLL_SEC,
+                         max_wait_sec: float = config.READINESS_MAX_WAIT_SEC) -> dict[str, Any]:
+        """로딩(LOAD)/언로딩(UNLOAD) 전에 WCS readiness가 READY가 될 때까지 블록한다 (v07.4 9장).
+
+        NOT_READY 또는 조회 실패(UNKNOWN)면 poll_sec마다 재확인하고, max_wait_sec를 넘기면 ReadinessTimeout.
+        대기 중 WCS 취소 요청이 오면 OrderCanceled. 오더에 stationId가 없으면 경고만 남기고 통과한다.
+        """
+        operation = operation.upper()
+        station_field = READINESS_STATION_FIELD[operation]
+        order = self._current_order
+        if order is None:
+            log.warning("진행 중 오더가 없어 %s readiness 확인을 건너뜁니다.", operation)
+            return {"status": "READY", "ready": True, "skipped": True}
+        station_id = order.get(station_field)
+        order_id = str(order["wcsOrderId"])
+        if not station_id:
+            log.warning("오더 %s에 %s가 없어 %s readiness 확인 없이 진행합니다.", order_id, station_field, operation)
+            return {"status": "READY", "ready": True, "skipped": True}
+        station_id = str(station_id)
+
+        started = time.monotonic()
+        last_progress_log = started
+        last_status: str | None = None
+        last_reason: str | None = None
+        attempts = 0
+        while True:
+            self.raise_if_cancel_requested()
+            attempts += 1
+            body = self._client.get_readiness(station_id, operation, order_id)
+            if body is None:
+                status, reason = "UNKNOWN", None
+            else:
+                status = str(body.get("status") or ("READY" if body.get("ready") is True else "NOT_READY")).upper()
+                reason = body.get("reasonCode")
+            ready = status == "READY" or (body is not None and body.get("ready") is True)
+
+            if status != last_status or reason != last_reason:
+                if ready:
+                    log.info("%s readiness %s: READY (%d회 조회, %.0f초) -> %s 시작", operation, station_id,
+                             attempts, time.monotonic() - started, "로딩" if operation == "LOAD" else "언로딩")
+                else:
+                    log.info("%s readiness %s: %s (reasonCode=%s) — %.0f초마다 재확인 (최대 %.0f초)",
+                             operation, station_id, status, reason, poll_sec, max_wait_sec)
+                last_status, last_reason = status, reason
+            else:
+                log.debug("%s readiness %s: %s", operation, station_id, status)
+
+            if ready:
+                return dict(body or {"status": "READY", "ready": True})
+
+            waited = time.monotonic() - started
+            if waited >= max_wait_sec:
+                log.error("%s readiness %s: %.0f초 동안 READY가 되지 않았습니다 (마지막 %s, reasonCode=%s)",
+                          operation, station_id, waited, status, reason)
+                raise ReadinessTimeout(station_id, operation, waited, reason)
+            if time.monotonic() - last_progress_log >= 30.0:
+                log.info("%s readiness %s: %.0f초째 대기 중 (%s)", operation, station_id, waited, status)
+                last_progress_log = time.monotonic()
+
+            # 취소가 오면 곧바로 반응하도록 poll_sec를 잘게 쪼개 기다린다.
+            deadline = min(time.monotonic() + poll_sec, started + max_wait_sec)
+            while time.monotonic() < deadline:
+                self.raise_if_cancel_requested()
+                time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
     def _on_queued_cancel(self, order_id: str, cancel_info: dict[str, Any]) -> None:
         """아직 시작 전인 오더가 취소됐다. 정지할 작업이 없으므로 즉시 CANCELED를 보고한다."""
         log.info("대기 중 오더 취소 -> 즉시 CANCELED 보고: %s (reasonCode=%s)",
@@ -248,7 +344,8 @@ class WcsPublisher:
         self._current_order = None
         return self._send_event(str(order["wcsOrderId"]), event_type, result, message)
 
-    def _send_event(self, order_id: str, event_type: str, result: str, message: str | None) -> bool:
+    def _send_event(self, order_id: str, event_type: str, result: str, message: str | None,
+                    *, node_id: str | None = None) -> bool:
         body = {
             "eventId": uuid.uuid4().hex,
             "wcsOrderId": order_id,
@@ -258,8 +355,12 @@ class WcsPublisher:
             "message": (message or "").strip()[:200] or None,
             "occurredAt": _now_iso(),
         }
+        if node_id is not None:
+            body["nodeId"] = str(node_id)
 
-        self._order_receiver.set_status(order_id, event_type)
+        # 오더 상태는 최종 이벤트만 바꾼다. 도착 보고 같은 중간 이벤트가 CANCEL_REQUESTED를 덮어쓰면 취소가 유실된다.
+        if event_type in FINAL_EVENT_TYPES:
+            self._order_receiver.set_status(order_id, event_type)
 
         # 실패해도 데모를 막지 않는다. eventId를 유지한 채 큐에 넣어두면
         # 전송 스레드가 매 주기 재시도하므로 WCS가 열리는 즉시 전송된다(중복은 eventId로 멱등).
