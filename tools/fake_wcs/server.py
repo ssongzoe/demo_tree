@@ -54,7 +54,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 PORT = int(os.getenv("FAKE_WCS_PORT", "5226"))
 BIND = os.getenv("FAKE_WCS_BIND", "0.0.0.0")
 COOLDOWN_SEC = float(os.getenv("FAKE_WCS_COOLDOWN_SEC", "15"))
-ROBOT_URL = os.getenv("FAKE_WCS_ROBOT_URL", "http://127.0.0.1:5225").rstrip("/")
+ROBOT_URL = os.getenv("FAKE_WCS_ROBOT_URL", "http://127.0.0.1:3000").rstrip("/")
 ROBOT_ORDER_PATH = os.getenv("FAKE_WCS_ROBOT_ORDER_PATH", "/api/v1/wcs/transport-orders")
 FROM_STATION = os.getenv("FAKE_WCS_FROM_STATION", "RACK01_PORT01")
 TO_STATION = os.getenv("FAKE_WCS_TO_STATION", "CV02_IN")
