@@ -15,6 +15,8 @@
 10. WCS가 취소(POST .../{wcsOrderId}/cancel)를 보내면 단계 경계(안전 지점)에서 정지하고 CANCELED를 콜백한다.
 11. 파지 전/배치 전에 WCS에 도착 보고(ARRIVED_AT_FROM/ARRIVED_AT_TO)를 보내고, PIO readiness(v07.4 9장)를
     GET으로 확인해 READY일 때만 로딩/언로딩을 시작한다. NOT_READY면 2초마다 재확인, 120초 초과 시 FAILED.
+12. COMPLETED는 배치 후 복귀 1/2(BACK 후진)가 끝난 직후 보고한다. 이후 회전·복귀 주행과 팔/헤드 이동은
+    오더 밖의 로봇 내부 동작이라, 그 구간의 실패는 FAILED 콜백이 아니라 status의 ERROR/error_message로만 전달된다.
     모션 도중에는 끊지 않으므로 토트를 든 채 정지할 수 있으며, 이후 복구는 운영자가 수행한다
 
 이동 거리와 회전각은 아래 target 상수만 수정하면 되며, 실행 로그는 target 값을 직접 읽어 출력하므로 값과 설명이 따로 어긋나지 않는다.
@@ -390,8 +392,12 @@ def lower_release_and_retract(robot, gripper) -> bool:
 
 
 # 4.돌아온다
-def run_return_route(robot, monitor) -> bool:
-    """BACK을 단독 수행한 뒤 TURN + STRAIGHT direct target으로 복귀한다."""
+def run_return_route(robot, monitor, on_back_done=None) -> bool:
+    """BACK을 단독 수행한 뒤 TURN + STRAIGHT direct target으로 복귀한다.
+
+    on_back_done은 복귀 1/2(BACK 후진)가 끝난 직후, 회전 시작 전에 한 번 호출된다 (WCS COMPLETED 보고 지점).
+    콜백 예외는 복귀 주행을 막지 않는다.
+    """
     stream = robot.create_command_stream(priority=10)
     head_move = None
     arm_up_move = None
@@ -399,6 +405,12 @@ def run_return_route(robot, monitor) -> bool:
     try:
         if not run_mobile_leg(robot, monitor, stream, "복귀 1/2: BACK", RETURN_BACK_TARGET, 3.0, False, 0.0):
             return False
+
+        if on_back_done is not None:
+            try:
+                on_back_done()
+            except Exception as error:  # noqa: BLE001 - 보고 실패로 복귀 주행을 멈추지 않는다.
+                print(f"복귀 후진 완료 콜백 실패 (복귀는 계속 진행): {error}")
 
         arm_up_move = move_arms_async(
             robot,
@@ -440,13 +452,14 @@ def run_return_route(robot, monitor) -> bool:
 
 
 def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_index: int,
-              cancel_check=None, readiness_wait=None) -> None:
+              cancel_check=None, readiness_wait=None, complete_report=None) -> None:
     """박스 인식/파지부터 이송, AR 정렬, 배치, 복귀까지 한 사이클을 수행하며 완료 후 다음 사이클을 같은 위치에서 시작한다.
 
     cancel_check는 WCS 취소 요청 확인용 콜백이다. 모션 도중이 아니라 단계 경계(안전 지점)에서만
     호출하므로, 취소 시 로봇은 마지막으로 완료한 단계의 자세에서 정지한다. 이후 복구는 운영자가 수행한다.
     readiness_wait(operation)은 WCS PIO readiness 확인용 콜백이다. 파지 전 "LOAD", 배치 전 "UNLOAD"로 호출하며
     READY가 될 때까지 블록한다(대기 중 취소 요청은 OrderCanceled, 최대 대기 초과는 ReadinessTimeout).
+    complete_report는 WCS COMPLETED 보고 콜백이다. 복귀 1/2(BACK 후진) 완료 직후 호출되며, 그 이후 구간은 오더 밖이다.
     """
     check_cancel = cancel_check or (lambda: None)
     wait_ready = readiness_wait or (lambda operation: None)
@@ -485,7 +498,9 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
         f"복귀 시작: BACK {describe_target(RETURN_BACK_TARGET)} → "
         f"TURN + STRAIGHT direct {describe_target(RETURN_TURN_AND_STRAIGHT_TARGET)}"
     )
-    if not run_return_route(robot, monitor):
+    # COMPLETED는 복귀 1/2(BACK) 완료 시점에 보고된다. 이후 회전·복귀 실패는 오더가 이미 종료된 뒤라
+    # FAILED 콜백 없이 status(ERROR/error_message)로만 전달된다.
+    if not run_return_route(robot, monitor, on_back_done=complete_report):
         raise RuntimeError("복귀 주행 실패")
 
     print(f"{'=' * 24} CYCLE {cycle_index} DONE {'=' * 25}")
@@ -507,6 +522,16 @@ def _make_readiness_wait(wcs_publisher: WcsPublisher):
         wcs_publisher.wait_until_ready(operation)
 
     return wait
+
+
+def _make_complete_report(wcs_publisher: WcsPublisher, cycle_index: int):
+    """복귀 1/2(BACK 후진) 완료 직후 호출: 현재 오더를 COMPLETED로 보고한다."""
+
+    def report() -> None:
+        print(f"WCS COMPLETED 보고 (사이클 {cycle_index}, 복귀 후진 완료 시점)")
+        wcs_publisher.complete_order()
+
+    return report
 
 
 def main() -> None:
@@ -593,7 +618,9 @@ def main() -> None:
                           cancel_check=None if args.no_wcs_order
                           else wcs_publisher.raise_if_cancel_requested,
                           readiness_wait=None if args.no_wcs_order
-                          else _make_readiness_wait(wcs_publisher))
+                          else _make_readiness_wait(wcs_publisher),
+                          complete_report=None if args.no_wcs_order
+                          else _make_complete_report(wcs_publisher, cycle_index))
             except OrderCanceled as cancel:
                 # 단계 경계에서 안전 정지한 상태. CANCELED를 보고하고 다음 오더를 기다린다.
                 # 토트를 든 채 정지했을 수 있으며, 이후 복구는 운영자가 수행한다 (v07.3 4.8).
@@ -605,6 +632,7 @@ def main() -> None:
                 continue
             wcs_publisher.set_work_state("DONE")
             if not args.no_wcs_order:
+                # 정상이면 복귀 후진 완료 시점에 이미 보고되어 no-op. 콜백이 호출되지 못한 경로의 안전망.
                 wcs_publisher.complete_order()
             completed_cycles += 1
             cycle_index += 1

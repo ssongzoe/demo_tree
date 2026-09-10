@@ -6,7 +6,8 @@
 
 데모(demo_full_sequence_loop.py)와 같은 통신 모듈(communication.wcs)을 그대로 쓴다:
 IDLE(하트비트) → WCS 반송 오더 수신(POST :5225) → ARRIVED_AT_FROM + LOAD readiness 대기 → WORKING(work-sec/2)
-→ ARRIVED_AT_TO + UNLOAD readiness 대기 → WORKING(work-sec/2) → DONE + COMPLETED 콜백 → IDLE … 반복.
+→ ARRIVED_AT_TO + UNLOAD readiness 대기 → WORKING(work-sec/4, 배치+후진) → COMPLETED 콜백
+→ WORKING(work-sec/4, 회전·복귀: 오더 밖) → DONE → IDLE … 반복. (데모와 같이 COMPLETED는 복귀 후진 완료 시점)
 WORKING 중 취소(POST .../{wcsOrderId}/cancel)가 오면 중단하고 CANCELED 콜백을 보낸다.
 readiness가 최대 대기(READINESS_MAX_WAIT_SEC) 안에 READY가 안 되면 FAILED(PIO_NOT_READY_TIMEOUT)를 보고한다.
 """
@@ -106,7 +107,11 @@ def main() -> int:
                 if not canceled:
                     publisher.report_arrival("TO")
                     publisher.wait_until_ready("UNLOAD")
-                    canceled = not work(args.work_sec / 2)
+                    canceled = not work(args.work_sec / 4)  # 배치 + 복귀 1/2(후진)
+                if not canceled:
+                    log.info("COMPLETED 보고 (복귀 후진 완료 시점)")
+                    publisher.complete_order()
+                    time.sleep(args.work_sec / 4)  # 복귀 2/2(회전·복귀): 오더 밖이라 취소 확인 없음
             except OrderCanceled:
                 canceled = True
             if canceled:
@@ -119,7 +124,7 @@ def main() -> int:
             if args.error:
                 raise RuntimeError(args.error)
             publisher.set_work_state("DONE")
-            publisher.complete_order()
+            publisher.complete_order()  # 정상이면 이미 보고되어 no-op (데모와 같은 안전망)
             log.info("사이클 %d 완료", cycle)
             completed += 1
             cycle += 1

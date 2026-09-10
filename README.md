@@ -23,7 +23,9 @@ RBY1 ──POST /api/v1/rb/transport-events──▶ WCS                        
 ```
 
 한 사이클 안의 순서: 오더 수신 → `ARRIVED_AT_FROM` → LOAD readiness READY 대기 → 파지·이송·AR 정렬 →
-`ARRIVED_AT_TO` → UNLOAD readiness READY 대기 → 배치·복귀 → `COMPLETED`.
+`ARRIVED_AT_TO` → UNLOAD readiness READY 대기 → 배치 → 복귀 후진(BACK) → **`COMPLETED`** → 회전·복귀 주행(오더 밖).
+COMPLETED 이후 로봇은 수 초간 더 복귀 중이라 status의 work_cycle은 WORKING을 유지하다 사이클이 끝나면 DONE → IDLE이 된다.
+그 구간의 실패는 오더가 이미 종료된 뒤라 FAILED 콜백 없이 status의 ERROR/error_message로만 전달된다.
 readiness는 NOT_READY(또는 조회 실패)면 `READINESS_POLL_SEC`(2초)마다 재확인하고, `READINESS_MAX_WAIT_SEC`(120초)를 넘기면
 `PIO_NOT_READY_TIMEOUT`을 message로 `FAILED`를 보고한다. 대기 중 취소 요청이 오면 `CANCELED`로 끝난다.
 
@@ -95,6 +97,9 @@ WCS publisher 종료: sent=N failed=0
 서버 로그에는 `[READY -> RUNNING] 오더 발행 … ACCEPTED` → `transport-event 수신: COMPLETED` → `[RUNNING -> COOLDOWN]` 전이가 찍힌다.
 로봇이 아직 안 떠 있을 때 서버가 "로봇 오더 서버에 연결할 수 없습니다 — 2초마다 재시도"를 내는 것은 정상이다.
 
+COMPLETED는 복귀 후진이 끝나는 시점에 오므로, 그 뒤 WCS가 바로 다음 오더를 POST하면 로봇 오더 서버 큐에 쌓였다가
+복귀가 끝난 뒤 시작된다(자동 발행 모드에서는 COOLDOWN이 그 여유 역할). COMPLETED 이후 취소 요청은 409 `ORDER_ALREADY_FINALIZED`.
+
 readiness 시나리오(규격 11장 T-03/T-04) 재현:
 
 - **T-03 NOT_READY 후 READY**: PIO 카드에서 `CV02_OUT` LOAD를 NOT_READY로 두고 [오더 발행] → 로봇이 파지 전에 멈춰
@@ -144,7 +149,7 @@ curl -X POST localhost:5225/api/v1/wcs/transport-orders -H 'Content-Type: applic
 |---|---|---|
 | WCS→로봇 | `POST /api/v1/wcs/transport-orders` | `{wcsOrderId, carrierId, fromStationId, toStationId, priority, timestamp}` → 201 `{wcsOrderId, orderStatus:"ACCEPTED", timestamp}`. 동일 ID 재전송 200(멱등), 내용 다르면 409 `DUPLICATE_ORDER_CONFLICT`, 필수값 누락 400 |
 | WCS→로봇 | `POST /api/v1/wcs/transport-orders/{wcsOrderId}/cancel` | `{reasonCode, reason?, requestedAt}` → 202 `CANCEL_REQUESTED`(접수) 후 로봇이 단계 경계에서 안전 정지하고 `CANCELED` 콜백. 중복 200, 미존재 404, 이미 종료 409 (v07.3 4.8 준용) |
-| 로봇→WCS | `POST /api/v1/rb/transport-events` | `{eventId, wcsOrderId, eventType: ARRIVED_AT_FROM\|ARRIVED_AT_TO\|COMPLETED\|FAILED\|CANCELED, robotSerial, nodeId?, result, message, occurredAt}` → `{accepted:true, eventId, receivedAt}`. eventId로 멱등, 실패 시 큐에 보관 후 재시도. 도착 보고 2종은 오더 상태를 바꾸지 않는다 |
+| 로봇→WCS | `POST /api/v1/rb/transport-events` | `{eventId, wcsOrderId, eventType: ARRIVED_AT_FROM\|ARRIVED_AT_TO\|COMPLETED\|FAILED\|CANCELED, robotSerial, nodeId?, result, message, occurredAt}` → `{accepted:true, eventId, receivedAt}`. eventId로 멱등, 실패 시 큐에 보관 후 재시도. 도착 보고 2종은 오더 상태를 바꾸지 않는다. COMPLETED 시점 = 배치 후 복귀 후진(BACK) 완료 직후 |
 | 로봇→WCS | `GET /api/v1/rb/stations/{stationId}/readiness?operation=LOAD\|UNLOAD&wcsOrderId=` | v07.4 9장 PIO readiness → `{stationId, operation, status: READY\|NOT_READY, ready, reasonCode, updatedAt}`. 파지 전 LOAD(fromStationId), 배치 전 UNLOAD(toStationId). NOT_READY/조회 실패면 2초마다 재확인, 120초 초과 시 FAILED(`PIO_NOT_READY_TIMEOUT`) |
 | 로봇→WCS | `POST /api/v1/rb/rby1/status` | 기존 status payload 1Hz → 201 `{"accepted":true}` |
 | 로봇→WCS | `GET /health` | `healthy` |
