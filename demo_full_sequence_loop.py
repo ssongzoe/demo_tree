@@ -35,7 +35,8 @@ from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_arms_through_waypoint, move_torso_and_head
 from skills.ar_align import ARAligner
-from skills.tote_align import ToteAligner
+# from skills.tote_align import ToteAligner
+from skills.tote_align_dual_recovery import ToteAligner
 from utils.ar_marker import RealSenseCamera
 
 # -----------------------------------------------------------------------------
@@ -89,8 +90,8 @@ STRETCH_LEFT = np.deg2rad([-39.812, 36.426, 20.479, -60.830, 65.634, 89.689, 10.
 STRETCH_TORSO = np.deg2rad([0.000, 33.773, -46.870, 23.097, 0.000, 0.001]).tolist()
 
 
-AFTER_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
-AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
+AFTER_RIGHT = np.deg2rad([-50.297, -38.910, -16.532, -38.260, -24.700, 65.959, -0.004]).tolist()
+AFTER_LEFT = np.deg2rad([-50.297, 38.910, 16.532, -38.260, 24.700, 65.959, 0.004]).tolist()
 
 BACK_RIGHT = np.deg2rad([-13.642, -27.690, -33.932, -95.436, -56.100, 59.591, -7.149]).tolist()
 BACK_LEFT = np.deg2rad([-13.642, 27.690, 33.932, -95.436, 56.100, 59.591, 7.149]).tolist()
@@ -114,13 +115,13 @@ LIFT_PULL_STREAM_RATE_HZ = 100.0
 # 아래 target 값만 수정하면 실제 실행 로그도 현재 값에 맞춰 자동으로 바뀐다.
 # -----------------------------------------------------------------------------
 
-OUTBOUND_DIRECT_TARGET = (-0.80, 1.40, math.radians(+181.85))
+OUTBOUND_DIRECT_TARGET = (-0.80, 1.40, math.radians(+184.85))
 OUTBOUND_DIRECT_DURATION = 8.0 # 가는거 8초
-OUTBOUND_HEAD_DELAY = 3.0
+OUTBOUND_HEAD_DELAY = 2.0
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 
-RETURN_TURN_AND_STRAIGHT_TARGET = (-0.80, 1.5, math.radians(-183.43))
+RETURN_TURN_AND_STRAIGHT_TARGET = (-0.85, 1.47, math.radians(-183.43))
 RETURN_TURN_AND_STRAIGHT_DURATION = 9.0 #오는거 9초
 
 # ------------------------------------------------------------------
@@ -360,7 +361,7 @@ def run_turn_and_go(robot, monitor) -> bool:
 # 3.놓는다
 def lower_release_and_retract(robot, gripper) -> bool:
     """AR 정렬 후 UP에서 DOWN로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 AFTER 자세로 양팔을 후퇴한다."""
-    print("[1/6] UP → stretch")
+    print("[1/3] UP → stretch")
     
     stretch_torso_move = move_torso_and_head_async(
         robot,
@@ -374,16 +375,16 @@ def lower_release_and_retract(robot, gripper) -> bool:
     if not move_both_arms(robot, STRETCH_RIGHT, STRETCH_LEFT, minimum_time=1.0):
         print("STRETCH 자세 이동 실패")
         return False
-
-    print("[1/6] stretch -> Down ")
+        
+    print("[2/3] stretch -> Down ")
     if not move_both_arms(robot, DOWN_RIGHT, DOWN_LEFT, minimum_time=1.0):
         print("DOWN 자세 이동 실패")
         return False
-
+    
     print("그리퍼 열기")
     gripper.open(duration=1.0)
-
-    print("DOWN → AFTER")
+        
+    print("[3/3] DOWN → AFTER")
     if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=1.0):
         print("AFTER 자세 이동 실패")
         return False
