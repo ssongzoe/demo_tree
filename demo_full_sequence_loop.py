@@ -2,7 +2,12 @@
 
 동작 순서
 0. torso / head를 calibration 기준 자세로 먼저 맞춘 뒤, main에서 Head RealSense pipeline을 한 번만 시작해 Tote/AR가 함께 사용
-1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
+1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬 (skills.tote_align_infinite).
+   박스 인식 실패(미검출 / 카메라 오류 / hard limit을 넘는 오검출)는 데모를 끝내지 않고
+   같은 자리에서 계속 재측정하며, WCS 취소 요청이나 Ctrl+C로만 빠져나온다.
+   정렬이 끝나면 파지 직전에 같은 자세에서 한 번 더 측정해 grasp 허용 범위를 재확인하고,
+   벗어나면 정렬을 다시 수행한다 (FINAL_CHECK_ROUNDS).
+   임포트를 skills.tote_align으로 바꾸면 기존처럼 2회 시도 후 실패로 끝나고 최종 확인도 없다
 2. Tote 정렬 후 BEFORE → GRASP로 파지하고, UP 근처를 통과해 PULL까지 J자 경로로 연속 이동
 3. BACK + TURN + STRAIGHT를 합성한 direct target으로 이송하며 후반에 Head를 정면 자세로 전환
 4. AR 마커 기준으로 배치 위치 정렬
@@ -23,6 +28,7 @@
 """
 
 import argparse
+import inspect
 import math
 import threading
 import time
@@ -35,8 +41,9 @@ from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_arms_through_waypoint, move_torso_and_head
 from skills.ar_align import ARAligner
-# from skills.tote_align import ToteAligner
-from skills.tote_align_dual_recovery import ToteAligner
+from skills.tote_align_infinite import ToteAligner  # 인식 실패 시 무한 재측정
+#from skills.tote_align import ToteAligner
+#from skills.tote_align_dual_recovery import ToteAligner
 from utils.ar_marker import RealSenseCamera
 
 # -----------------------------------------------------------------------------
@@ -90,14 +97,17 @@ STRETCH_LEFT = np.deg2rad([-39.812, 36.426, 20.479, -60.830, 65.634, 89.689, 10.
 STRETCH_TORSO = np.deg2rad([0.000, 33.773, -46.870, 23.097, 0.000, 0.001]).tolist()
 
 
-AFTER_RIGHT = np.deg2rad([-50.297, -38.910, -16.532, -38.260, -24.700, 65.959, -0.004]).tolist()
-AFTER_LEFT = np.deg2rad([-50.297, 38.910, 16.532, -38.260, 24.700, 65.959, 0.004]).tolist()
+AFTER_RIGHT = np.deg2rad([-50.297, -38.910, -16.532, -38.260, -40.700, 65.959, -0.004]).tolist()
+AFTER_LEFT = np.deg2rad([-50.297, 38.910, 16.532, -38.260, 40.700, 65.959, 0.004]).tolist()
 
-BACK_RIGHT = np.deg2rad([-13.642, -27.690, -33.932, -95.436, -56.100, 59.591, -7.149]).tolist()
-BACK_LEFT = np.deg2rad([-13.642, 27.690, 33.932, -95.436, 56.100, 59.591, 7.149]).tolist()
+# BACK_RIGHT = np.deg2rad([-13.642, -27.690, -33.932, -95.436, -56.100, 59.591, -7.149]).tolist()
+# BACK_LEFT = np.deg2rad([-13.642, 27.690, 33.932, -95.436, 56.100, 59.591, 7.149]).tolist()
 
-HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
-HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
+BACK_RIGHT = np.deg2rad([54.000, -25.000, -58.000, -138.000, -87.000, 63.000, -7.000]).tolist()
+BACK_LEFT = np.deg2rad([54.000, 25.000, 58.000, -138.000, 87.000, 63.000, 7.000]).tolist()
+
+HEAD_DOWN = np.deg2rad([-3.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
+HEAD_FORWARD = np.deg2rad([-3.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
 
 HEAD_MOVE_TIME = 2.0
 ARM_UP_MOVE_TIME = 2.0
@@ -148,6 +158,22 @@ def run_mobile_leg(robot, monitor, stream, step: str, target, duration: float, s
     )
 
     return move_leg(robot, monitor, leg, settle=settle, stream=stream, stop_at_end=stop_at_end)
+
+
+def align_tote_once(tote_aligner, robot, monitor, abort_check=None) -> bool:
+    """Tote 정렬을 수행한다. 파지 전 최종 확인을 지원하는 aligner면 그 경로를 사용한다.
+
+    align_and_confirm()이 있으면 정렬 후 같은 자세에서 한 번 더 측정해 허용 범위를 재확인하고,
+    없으면 기존 align()만 호출한다. abort_check는 그 인자를 받는 aligner에만 전달하므로
+    임포트를 skills.tote_align이나 skills.tote_align_dual_recovery로 바꿔도 그대로 동작한다.
+    """
+    align = getattr(tote_aligner, "align_and_confirm", tote_aligner.align)
+    options = {"verify": True}
+
+    if abort_check is not None and "abort_check" in inspect.signature(align).parameters:
+        options["abort_check"] = abort_check
+
+    return align(robot, monitor, **options)
 
 
 def move_torso_and_head_async(
@@ -269,12 +295,18 @@ def detect_grasp_and_lift(
     tote_aligner: ToteAligner,
     gripper_target: float,
     gripper_torque: float,
+    abort_check=None,
 ) -> bool:
-    """GRASP에서 양팔과 Torso를 동시에 움직인 뒤 UP → PULL을 연속 수행한다."""
+    """GRASP에서 양팔과 Torso를 동시에 움직인 뒤 UP → PULL을 연속 수행한다.
+
+    무한 재측정 aligner(skills.tote_align_infinite)를 쓰면 Tote 인식 실패로 끝나지 않고
+    같은 자리에서 계속 재측정하며, 파지 직전에 정렬 상태를 한 번 더 확인한다.
+    abort_check는 그 대기를 끊는 훅이며, WCS 취소 요청이 오면 예외를 던져 빠져나온다.
+    """
 
 
-    print("[1/5] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
-    if not tote_aligner.align(robot, monitor, verify=True):
+    print("[1/5] 현재 자세에서 Tote 영상 인식 + one-shot 정렬 후 파지 전 최종 확인")
+    if not align_tote_once(tote_aligner, robot, monitor, abort_check=abort_check):
         print("Tote one-shot 정렬 실패")
         return False
 
@@ -476,6 +508,7 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
         tote_aligner=tote_aligner,
         gripper_target=args.gripper_target,
         gripper_torque=args.gripper_torque,
+        abort_check=check_cancel,
     ):
         raise RuntimeError("Tote 인식 / 정렬 / 파지 실패")
 
