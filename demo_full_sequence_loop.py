@@ -8,7 +8,7 @@
    정렬이 끝나면 파지 직전에 같은 자세에서 한 번 더 측정해 grasp 허용 범위를 재확인하고,
    벗어나면 정렬을 다시 수행한다 (FINAL_CHECK_ROUNDS).
    임포트를 skills.tote_align으로 바꾸면 기존처럼 2회 시도 후 실패로 끝나고 최종 확인도 없다
-2. Tote 정렬 후 BEFORE → GRASP로 파지하고, UP 근처를 통과해 PULL까지 J자 경로로 연속 이동
+2. Tote 정렬 후 BEFORE → GRASP_READY → GRASP로 파지하고, UP 근처를 통과해 PULL까지 J자 경로로 연속 이동
 3. BACK + TURN + STRAIGHT를 합성한 direct target으로 이송하며 후반에 Head를 정면 자세로 전환
 4. AR 마커 기준으로 배치 위치 정렬
 5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE 자세로 후퇴
@@ -75,8 +75,17 @@ INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 BEFORE_RIGHT = np.deg2rad([-38.23, -53.19, -21.31, -48.14, -63.73, 81.18, 2.39]).tolist()
 BEFORE_LEFT = np.deg2rad([-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]).tolist()
 
-GRASP_RIGHT = np.deg2rad([-28.592, -28.537, -30.579, -80.469, -63.332, 91.746, -7.972]).tolist()
-GRASP_LEFT = np.deg2rad([-28.592, 28.537, 30.579, -80.469, 63.332, 91.746, 7.972]).tolist()
+# GRASP_READY_RIGHT = np.deg2rad([-60.676, -67.618, 42.293, -29.427, -113.870, 87.615, 30.544]).tolist()
+# GRASP_READY_LEFT = np.deg2rad([-60.676, 67.618, -42.293, -29.427, 113.870, 87.615, -30.544]).tolist()
+
+GRASP_READY_RIGHT = np.deg2rad([-17.100, -43.961, -39.402, -68.996, -79.612, 87.254, -6.351]).tolist()
+GRASP_READY_LEFT = np.deg2rad([-17.100, 43.961, 39.402, -68.996, 79.612, 87.254, 6.351]).tolist()
+
+# GRASP_RIGHT = np.deg2rad([-28.592, -28.537, -30.579, -80.469, -63.332, 91.746, -7.972]).tolist()
+# GRASP_LEFT = np.deg2rad([-28.592, 28.537, 30.579, -80.469, 63.332, 91.746, 7.972]).tolist()
+GRASP_RIGHT = np.deg2rad([-28.615, -28.590, -32.317, -80.741, -63.729, 94.080, -7.972]).tolist()
+GRASP_LEFT = np.deg2rad([-28.615, 28.590, 32.317, -80.741, 63.729, 94.080, 7.972]).tolist()
+
 GRASP_TORSO = np.deg2rad([0.020, 34.030, -53.957, 40.917, 0.050, 0.010]).tolist()
 
 UP_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
@@ -297,7 +306,7 @@ def detect_grasp_and_lift(
     gripper_torque: float,
     abort_check=None,
 ) -> bool:
-    """GRASP에서 양팔과 Torso를 동시에 움직인 뒤 UP → PULL을 연속 수행한다.
+    """BEFORE에서 GRASP_READY로 양팔과 Torso를 함께 움직이고, 양팔만 GRASP로 옮긴 뒤 UP → PULL을 연속 수행한다.
 
     무한 재측정 aligner(skills.tote_align_infinite)를 쓰면 Tote 인식 실패로 끝나지 않고
     같은 자리에서 계속 재측정하며, 파지 직전에 정렬 상태를 한 번 더 확인한다.
@@ -305,34 +314,39 @@ def detect_grasp_and_lift(
     """
 
 
-    print("[1/5] 현재 자세에서 Tote 영상 인식 + one-shot 정렬 후 파지 전 최종 확인")
+    print("[1/6] 현재 자세에서 Tote 영상 인식 + one-shot 정렬 후 파지 전 최종 확인")
     if not align_tote_once(tote_aligner, robot, monitor, abort_check=abort_check):
         print("Tote one-shot 정렬 실패")
         return False
 
-    print("[2/5] 현재 자세 → BEFORE")
+    print("[2/6] 현재 자세 → BEFORE")
     if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.0):
         print("BEFORE 자세 이동 실패")
         return False
 
-    print("[3/5] BEFORE → GRASP (양팔 + Torso 동시 이동)")
-    grasp_arm_move = move_arms_async(
+    print("[3/6] BEFORE → GRASP_READY (양팔 + Torso 동시 이동)")
+    ready_arm_move = move_arms_async(
         robot,
-        GRASP_RIGHT,
-        GRASP_LEFT,
-        "GRASP 양팔 이동 시작",
+        GRASP_READY_RIGHT,
+        GRASP_READY_LEFT,
+        "GRASP_READY 양팔 이동 시작",
         minimum_time=1.5,
     )
-    grasp_torso_move = move_torso_and_head_async(
+    ready_torso_move = move_torso_and_head_async(
         robot,
         GRASP_TORSO,
         HEAD_DOWN,
         "GRASP Torso 이동 시작",
         minimum_time=1.5,
     )
-    grasp_arm_ok = wait_for_arm_move(grasp_arm_move, "GRASP 양팔 자세 이동")
-    grasp_torso_ok = wait_for_head_move(grasp_torso_move, "GRASP Torso 자세 이동")
-    if not (grasp_arm_ok and grasp_torso_ok):
+    ready_arm_ok = wait_for_arm_move(ready_arm_move, "GRASP_READY 양팔 자세 이동")
+    ready_torso_ok = wait_for_head_move(ready_torso_move, "GRASP Torso 자세 이동")
+    if not (ready_arm_ok and ready_torso_ok):
+        print("GRASP_READY 자세 이동 실패")
+        return False
+
+    print("[4/6] GRASP_READY → GRASP (양팔)")
+    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
         print("GRASP 자세 이동 실패")
         return False
 
@@ -340,7 +354,7 @@ def detect_grasp_and_lift(
     gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
     print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
 
-    print("[4-5/5] GRASP → UP → PULL (Torso + 양팔 J-curve 연속 이동)")
+    print("[5-6/6] GRASP → UP → PULL (Torso + 양팔 J-curve 연속 이동)")
     if not move_torso_and_arms_through_waypoint(
         robot,
         start_pose={"torso": GRASP_TORSO, "right_arm": GRASP_RIGHT, "left_arm": GRASP_LEFT},
