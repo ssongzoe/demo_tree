@@ -100,12 +100,20 @@ class ARAligner:
         camera=None,
         target_marker_pos=TARGET_MARKER_POS,
         target_marker_yaw_deg=TARGET_MARKER_YAW_DEG,
+        forward_offset_m=0.0,
     ):
+        """forward_offset_m만큼 보정 목표보다 베이스를 더 전진시킨다 (+면 전진, -면 후진).
+
+        OpenCV camera +z가 robot +x(forward)이므로 목표 marker z를 그만큼 줄여 적용한다.
+        정렬 명령, 허용 오차 판정, 최종 확인이 모두 같은 보정된 목표를 쓴다.
+        """
         if camera is not None and camera_serial is not None:
             raise ValueError("공용 camera 사용 시 camera_serial은 함께 지정할 수 없습니다.")
 
         self.marker_id = marker_id
-        self.target_marker_pos = np.asarray(target_marker_pos, dtype=np.float64)
+        self.forward_offset_m = float(forward_offset_m)
+        self.target_marker_pos = np.asarray(target_marker_pos, dtype=np.float64).copy()
+        self.target_marker_pos[2] -= self.forward_offset_m
         self.target_marker_yaw_deg = float(target_marker_yaw_deg)
 
         self.detector = create_detector(ARUCO_DICT)
@@ -173,7 +181,8 @@ class ARAligner:
         vertical_error = float(error[1])
 
         print(f"AR 측정: x={position[0]:+.3f}, y={position[1]:+.3f}, z={position[2]:+.3f} m, yaw={yaw_deg:+.2f} deg")
-        print(f"AR 목표: x={target[0]:+.3f}, y={target[1]:+.3f}, z={target[2]:+.3f} m, yaw={self.target_marker_yaw_deg:+.2f} deg")
+        print(f"AR 목표: x={target[0]:+.3f}, y={target[1]:+.3f}, z={target[2]:+.3f} m, yaw={self.target_marker_yaw_deg:+.2f} deg"
+              + (f" (전진 오프셋 {self.forward_offset_m * 100:+.1f} cm 반영)" if self.forward_offset_m else ""))
         print(f"One-shot command: x={x:+.3f} m, y={y:+.3f} m, yaw={yaw_error_deg:+.2f} deg")
 
         if abs(vertical_error) > VERTICAL_WARN_M:

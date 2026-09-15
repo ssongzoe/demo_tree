@@ -54,6 +54,8 @@ ADDRESS = "192.168.30.1:50051"
 
 HEAD_CAMERA_SERIAL = "250122079439"
 MARKER_ID = 8
+# AR 정렬 시 보정 목표보다 베이스를 더 전진시킬 거리 [m]. +면 전진, -면 후진.
+AR_FORWARD_OFFSET_M = 0.01
 
 # Tote 검출 보정은 이 Head 카메라 모드에서 수행했다. AR은 주입받은 카메라의 실제 intrinsic을 사용한다.
 HEAD_CAM_WIDTH = 640
@@ -599,7 +601,7 @@ def main() -> None:
     gripper = None
     head_camera = RealSenseCamera(HEAD_CAM_WIDTH, HEAD_CAM_HEIGHT, HEAD_CAM_FPS, serial=args.camera_serial)
     tote_aligner = ToteAligner(camera=head_camera, show=args.show_tote)
-    ar_aligner = ARAligner(marker_id=args.marker_id, camera=head_camera)
+    ar_aligner = ARAligner(marker_id=args.marker_id, camera=head_camera, forward_offset_m=AR_FORWARD_OFFSET_M)
     monitor = OdometryMonitor()
     wcs_publisher = WcsPublisher(robot_model=robot.model())
     state_update_started = False
