@@ -7,8 +7,11 @@
 - 첫 측정에서 선택한 side를 정렬이 끝날 때까지 유지
 - 둘 다 없거나 검출값이 hard limit을 만들면 로봇 전방(+X)으로 3 cm 이동 후 다시 측정
 - 전진 recovery는 최대 3회
+- 3회 이후에도 미검출 또는 hard limit 오검출이면 현재 위치에서 계속 재측정
+- RealSense의 일시적인 RuntimeError는 측정 실패로 처리하고 계속 재측정
+- abort_check를 전달하면 외부 취소 요청으로 무한 재측정을 중단할 수 있음
 
-같은 위치에서 재측정하지 않는다.
+보정 이동 또는 recovery 이동 자체가 실패한 경우에는 False를 반환한다.
 """
 
 from __future__ import annotations
@@ -70,6 +73,7 @@ HARD_MAX_YAW_DEG = 20.0
 # 미검출 recovery: 동일 위치 재시도 없이 매번 전진
 RECOVERY_FORWARD_STEP_M = 0.03
 MAX_RECOVERY_MOVES = 3
+MEASURE_RETRY_WAIT_S = 0.5
 
 # 모바일 trajectory
 SETTLE_S = 0.7
@@ -381,8 +385,29 @@ class ToteAligner:
         )
         return move_one_shot(robot, monitor, recovery_command)
 
-    def align(self, robot, monitor: OdometryMonitor, *, verify: bool = True) -> bool:
-        """한 번씩 측정하며 미검출이면 +3 cm 전진, 검출되면 선택 side로 정렬한다."""
+    def _wait_before_retry(self, abort_check=None) -> None:
+        """재측정 전 잠깐 기다리며 외부 취소 요청도 확인한다."""
+        deadline = time.monotonic() + MEASURE_RETRY_WAIT_S
+
+        while True:
+            if abort_check is not None:
+                abort_check()
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return
+
+            time.sleep(min(0.1, remaining))
+
+    def align(
+        self,
+        robot,
+        monitor: OdometryMonitor,
+        *,
+        verify: bool = True,
+        abort_check=None,
+    ) -> bool:
+        """미검출 시 제한 전진 후 현재 위치에서 성공할 때까지 재측정한다."""
         if not self.started:
             self.start()
 
@@ -392,28 +417,43 @@ class ToteAligner:
 
         while True:
             label = "BEFORE" if correction_count == 0 else f"AFTER {correction_count}"
-            measurement = measure_preferred_feature(
-                self.pipeline,
-                show=self.show,
-                label=label,
-                required_side=active_side,
-            )
+
+            if abort_check is not None:
+                abort_check()
+
+            try:
+                measurement = measure_preferred_feature(
+                    self.pipeline,
+                    show=self.show,
+                    label=label,
+                    required_side=active_side,
+                )
+            except RuntimeError as error:
+                print(f"{label} 카메라 측정 오류: {error}")
+                measurement = None
 
             if measurement is None:
-                if recovery_count >= MAX_RECOVERY_MOVES:
-                    print(f"Tote 정렬 실패: 전진 recovery {MAX_RECOVERY_MOVES}회 후에도 corner 미검출")
-                    return False
+                if recovery_count < MAX_RECOVERY_MOVES:
+                    recovery_count += 1
+                    if not self._run_forward_recovery(
+                        robot,
+                        monitor,
+                        recovery_count,
+                        f"{active_side or 'corner'} 미검출",
+                    ):
+                        print(
+                            f"Tote 정렬 실패: recovery "
+                            f"{recovery_count}/{MAX_RECOVERY_MOVES} 이동 실패"
+                        )
+                        return False
 
-                recovery_count += 1
-                if not self._run_forward_recovery(
-                    robot,
-                    monitor,
-                    recovery_count,
-                    f"{active_side or 'corner'} 미검출",
-                ):
-                    print(f"Tote 정렬 실패: recovery {recovery_count}/{MAX_RECOVERY_MOVES} 이동 실패")
-                    return False
+                    continue
 
+                print(
+                    f"전진 recovery {MAX_RECOVERY_MOVES}회 완료 후에도 "
+                    f"{active_side or 'corner'} 미검출: 현재 위치에서 계속 재측정합니다."
+                )
+                self._wait_before_retry(abort_check)
                 continue
 
             if active_side is None:
@@ -446,29 +486,31 @@ class ToteAligner:
             )
 
             if not command_is_reasonable(raw_command):
-                if recovery_count >= MAX_RECOVERY_MOVES:
-                    print(
-                        f"Tote 정렬 실패: 전진 recovery {MAX_RECOVERY_MOVES}회 후에도 "
-                        f"hard limit 초과 (translation={distance_m:.3f} m, "
-                        f"yaw={raw_command.yaw_deg:+.2f} deg)"
-                    )
-                    return False
-
-                recovery_count += 1
-                reason = (
-                    f"비정상 검출/hard limit "
+                detail = (
                     f"(translation={distance_m:.3f} m, yaw={raw_command.yaw_deg:+.2f} deg)"
                 )
 
-                if not self._run_forward_recovery(
-                    robot,
-                    monitor,
-                    recovery_count,
-                    reason,
-                ):
-                    print(f"Tote 정렬 실패: recovery {recovery_count}/{MAX_RECOVERY_MOVES} 이동 실패")
-                    return False
+                if recovery_count < MAX_RECOVERY_MOVES:
+                    recovery_count += 1
+                    if not self._run_forward_recovery(
+                        robot,
+                        monitor,
+                        recovery_count,
+                        f"비정상 검출/hard limit {detail}",
+                    ):
+                        print(
+                            f"Tote 정렬 실패: recovery "
+                            f"{recovery_count}/{MAX_RECOVERY_MOVES} 이동 실패"
+                        )
+                        return False
 
+                    continue
+
+                print(
+                    f"hard limit 초과: 오검출로 보고 현재 위치에서 재측정합니다. "
+                    f"{detail}"
+                )
+                self._wait_before_retry(abort_check)
                 continue
 
             command, scale = limit_command_step(raw_command)
@@ -499,12 +541,18 @@ def align_tote(
     camera_serial: str,
     verify: bool = True,
     show: bool = False,
+    abort_check=None,
 ) -> bool:
     """단독 demo 호환용 D435 start → align → stop wrapper."""
     aligner = ToteAligner(camera_serial=camera_serial, show=show)
 
     try:
         aligner.start()
-        return aligner.align(robot, monitor, verify=verify)
+        return aligner.align(
+            robot,
+            monitor,
+            verify=verify,
+            abort_check=abort_check,
+        )
     finally:
         aligner.stop()

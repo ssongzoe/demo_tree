@@ -2,8 +2,13 @@
 
 동작 순서
 0. torso / head를 calibration 기준 자세로 먼저 맞춘 뒤, main에서 Head RealSense pipeline을 한 번만 시작해 Tote/AR가 함께 사용
-1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬
-2. Tote 정렬 후 BEFORE → GRASP로 파지하고, UP 근처를 통과해 PULL까지 J자 경로로 연속 이동
+1. 현재 자세에서 D435 영상의 TOP + TL feature로 tote one-shot 정렬 (skills.tote_align_infinite).
+   박스 인식 실패(미검출 / 카메라 오류 / hard limit을 넘는 오검출)는 데모를 끝내지 않고
+   같은 자리에서 계속 재측정하며, WCS 취소 요청이나 Ctrl+C로만 빠져나온다.
+   정렬이 끝나면 파지 직전에 같은 자세에서 한 번 더 측정해 grasp 허용 범위를 재확인하고,
+   벗어나면 정렬을 다시 수행한다 (FINAL_CHECK_ROUNDS).
+   임포트를 skills.tote_align으로 바꾸면 기존처럼 2회 시도 후 실패로 끝나고 최종 확인도 없다
+2. Tote 정렬 후 BEFORE → GRASP_READY → GRASP로 파지하고, UP 근처를 통과해 PULL까지 J자 경로로 연속 이동
 3. BACK + TURN + STRAIGHT를 합성한 direct target으로 이송하며 후반에 Head를 정면 자세로 전환
 4. AR 마커 기준으로 배치 위치 정렬
 5. UP → GRASP로 내려놓고 그리퍼를 연 뒤 BEFORE 자세로 후퇴
@@ -13,12 +18,17 @@
 9. 각 사이클은 WCS가 로봇 측 오더 서버(:5225)에 POST한 반송 오더를 받은 뒤 시작하고, 완료/실패를 WCS에 콜백한다
    (AMR Transport Order 규격 준용). --no-wcs-order 이면 기존처럼 연속 반복
 10. WCS가 취소(POST .../{wcsOrderId}/cancel)를 보내면 단계 경계(안전 지점)에서 정지하고 CANCELED를 콜백한다.
+11. 파지 전/배치 전에 WCS에 도착 보고(ARRIVED_AT_FROM/ARRIVED_AT_TO)를 보내고, PIO readiness(v07.4 9장)를
+    GET으로 확인해 READY일 때만 로딩/언로딩을 시작한다. NOT_READY면 2초마다 재확인, 120초 초과 시 FAILED.
+12. COMPLETED는 배치 후 복귀 1/2(BACK 후진)가 끝난 직후 보고한다. 이후 회전·복귀 주행과 팔/헤드 이동은
+    오더 밖의 로봇 내부 동작이라, 그 구간의 실패는 FAILED 콜백이 아니라 status의 ERROR/error_message로만 전달된다.
     모션 도중에는 끊지 않으므로 토트를 든 채 정지할 수 있으며, 이후 복구는 운영자가 수행한다
 
 이동 거리와 회전각은 아래 target 상수만 수정하면 되며, 실행 로그는 target 값을 직접 읽어 출력하므로 값과 설명이 따로 어긋나지 않는다.
 """
 
 import argparse
+import inspect
 import math
 import threading
 import time
@@ -26,22 +36,26 @@ from concurrent.futures import Future
 
 import numpy as np
 
-from communication.wcs.publisher import OrderCanceled, WcsPublisher
+from communication.wcs.publisher import OrderCanceled, ReadinessTimeout, WcsPublisher
 from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_arms_through_waypoint, move_torso_and_head
-# from skills.ar_align import ARAligner
-# from skills.tote_align import ToteAligner
+from skills.ar_align import ARAligner
+from skills.tote_align_infinite import ToteAligner  # 인식 실패 시 무한 재측정
+#from skills.tote_align import ToteAligner
+#from skills.tote_align_dual_recovery import ToteAligner
 from utils.ar_marker import RealSenseCamera
 
 # -----------------------------------------------------------------------------
 # 로봇 / 카메라 설정
 # -----------------------------------------------------------------------------
 
-ADDRESS = "127.0.0.1:50051"
+ADDRESS = "192.168.30.1:50051"
 
 HEAD_CAMERA_SERIAL = "250122079439"
 MARKER_ID = 8
+# AR 정렬 시 보정 목표보다 베이스를 더 전진시킬 거리 [m]. +면 전진, -면 후진.
+AR_FORWARD_OFFSET_M = 0.01
 
 # Tote 검출 보정은 이 Head 카메라 모드에서 수행했다. AR은 주입받은 카메라의 실제 intrinsic을 사용한다.
 HEAD_CAM_WIDTH = 640
@@ -63,12 +77,18 @@ INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
 BEFORE_RIGHT = np.deg2rad([-38.23, -53.19, -21.31, -48.14, -63.73, 81.18, 2.39]).tolist()
 BEFORE_LEFT = np.deg2rad([-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]).tolist()
 
-# GRASP_RIGHT = np.deg2rad([-37.43, -32.30, -21.34, -49.22, -63.95, 81.79, 2.40]).tolist()
-# GRASP_LEFT = np.deg2rad([-37.43, 32.30, 21.34, -49.22, 63.95, 81.79, -2.40]).tolist()
+# GRASP_READY_RIGHT = np.deg2rad([-60.676, -67.618, 42.293, -29.427, -113.870, 87.615, 30.544]).tolist()
+# GRASP_READY_LEFT = np.deg2rad([-60.676, 67.618, -42.293, -29.427, 113.870, 87.615, -30.544]).tolist()
 
-GRASP_RIGHT = np.deg2rad([-29.44, -25.47, -27.98, -83.08, -60.68, 90.04, -10.97]).tolist()
-GRASP_LEFT = np.deg2rad([-29.45, 25.49, 28.05, -82.82, 60.79, 89.98, 10.78]).tolist()
-GRASP_TORSO = np.deg2rad([0.02, 33.00, -52.01, 40.00, 0.05, 0.01]).tolist()
+GRASP_READY_RIGHT = np.deg2rad([-17.100, -43.961, -39.402, -68.996, -79.612, 87.254, -6.351]).tolist()
+GRASP_READY_LEFT = np.deg2rad([-17.100, 43.961, 39.402, -68.996, 79.612, 87.254, 6.351]).tolist()
+
+# GRASP_RIGHT = np.deg2rad([-28.592, -28.537, -30.579, -80.469, -63.332, 91.746, -7.972]).tolist()
+# GRASP_LEFT = np.deg2rad([-28.592, 28.537, 30.579, -80.469, 63.332, 91.746, 7.972]).tolist()
+GRASP_RIGHT = np.deg2rad([-28.615, -28.590, -32.317, -80.741, -63.729, 94.080, -7.972]).tolist()
+GRASP_LEFT = np.deg2rad([-28.615, 28.590, 32.317, -80.741, 63.729, 94.080, 7.972]).tolist()
+
+GRASP_TORSO = np.deg2rad([0.020, 34.030, -53.957, 40.917, 0.050, 0.010]).tolist()
 
 UP_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
 UP_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
@@ -77,20 +97,35 @@ UP_TORSO = INITIAL_TORSO.copy()
 PULL_RIGHT = np.deg2rad([-4.50, -28.21, -33.62, -106.81, -74.26, 99.28, -19.51]).tolist()
 PULL_LEFT = np.deg2rad([-4.50, 28.21, 33.62, -106.81, 74.26, 99.28, 19.52]).tolist()
 
-DOWN_RIGHT = np.deg2rad([-53.243, -27.593, -16.509, -45.481, -31.781, 73.370, 0.012]).tolist()
-DOWN_LEFT = np.deg2rad([-51.643, 29.044, 19.947, -45.832, 35.513, 75.498, -0.036]).tolist()
+# DOWN_RIGHT = np.deg2rad([-37.490, -32.697, -20.042, -47.921, -65.180, 80.655, 3.111]).tolist()
+# DOWN_LEFT = np.deg2rad([-37.490, 32.697, 20.042, -47.921, 65.180, 80.655, -3.111]).tolist()
 
-STRETCH_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
-STRETCH_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
+DOWN_RIGHT = np.deg2rad([-37.520, -32.333, -20.061, -45.293, -65.269, 79.082, 1.384]).tolist()
+DOWN_LEFT = np.deg2rad([-37.520, 32.333, 20.061, -45.293, 65.269, 79.082, -1.384]).tolist()
 
-AFTER_RIGHT = np.deg2rad([-51.651, -35.387, -16.519, -42.941, -31.167, 73.404, 0.001]).tolist()
-AFTER_LEFT = np.deg2rad([-51.625, 37.742, 19.947, -44.127, 35.084, 75.497, -0.033]).tolist()
+# STRETCH_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
+# STRETCH_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
 
-BACK_RIGHT = np.deg2rad([-17.36, -31.32, -35.09, -99.56, -59.69, 98.00, -13.33]).tolist()
-BACK_LEFT = np.deg2rad([-17.36, 31.32, 35.09, -99.56, 59.69, 98.00, 13.33]).tolist()
+STRETCH_RIGHT = np.deg2rad([-39.812, -36.426, -20.479, -60.830, -65.634, 89.689, -10.742]).tolist()
+STRETCH_LEFT = np.deg2rad([-39.812, 36.426, 20.479, -60.830, 65.634, 89.689, 10.742]).tolist()
 
-HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
-HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
+STRETCH_TORSO = np.deg2rad([0.000, 33.773, -46.870, 23.097, 0.000, 0.001]).tolist()
+
+
+# AFTER_RIGHT = np.deg2rad([-50.297, -38.910, -16.532, -38.260, -40.700, 65.959, -0.004]).tolist()
+# AFTER_LEFT = np.deg2rad([-50.297, 38.910, 16.532, -38.260, 40.700, 65.959, 0.004]).tolist()
+
+AFTER_RIGHT = np.deg2rad([-33.680, -41.190, -26.891, -37.858, -69.438, 74.159, -0.359]).tolist()
+AFTER_LEFT = np.deg2rad([-33.680, 41.190, 26.891, -37.858, 69.438, 74.159, 0.359]).tolist()
+
+# BACK_RIGHT = np.deg2rad([-13.642, -27.690, -33.932, -95.436, -56.100, 59.591, -7.149]).tolist()
+# BACK_LEFT = np.deg2rad([-13.642, 27.690, 33.932, -95.436, 56.100, 59.591, 7.149]).tolist()
+
+BACK_RIGHT = np.deg2rad([54.000, -25.000, -58.000, -138.000, -87.000, 63.000, -7.000]).tolist()
+BACK_LEFT = np.deg2rad([54.000, 25.000, 58.000, -138.000, 87.000, 63.000, 7.000]).tolist()
+
+HEAD_DOWN = np.deg2rad([-3.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
+HEAD_FORWARD = np.deg2rad([-3.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
 
 HEAD_MOVE_TIME = 2.0
 ARM_UP_MOVE_TIME = 2.0
@@ -108,13 +143,13 @@ LIFT_PULL_STREAM_RATE_HZ = 100.0
 # 아래 target 값만 수정하면 실제 실행 로그도 현재 값에 맞춰 자동으로 바뀐다.
 # -----------------------------------------------------------------------------
 
-OUTBOUND_DIRECT_TARGET = (-0.80, 0.80, math.radians(+181.85))
+OUTBOUND_DIRECT_TARGET = (-0.80, 1.40, math.radians(+184.85))
 OUTBOUND_DIRECT_DURATION = 8.0 # 가는거 8초
-OUTBOUND_HEAD_DELAY = 3.0
+OUTBOUND_HEAD_DELAY = 2.0
 
 RETURN_BACK_TARGET = (-0.35, 0.0, 0.0)
 
-RETURN_TURN_AND_STRAIGHT_TARGET = (0.60, 0.3, math.radians(-183.43))
+RETURN_TURN_AND_STRAIGHT_TARGET = (-0.85, 1.47, math.radians(-183.43))
 RETURN_TURN_AND_STRAIGHT_DURATION = 9.0 #오는거 9초
 
 # ------------------------------------------------------------------
@@ -141,6 +176,22 @@ def run_mobile_leg(robot, monitor, stream, step: str, target, duration: float, s
     )
 
     return move_leg(robot, monitor, leg, settle=settle, stream=stream, stop_at_end=stop_at_end)
+
+
+def align_tote_once(tote_aligner, robot, monitor, abort_check=None) -> bool:
+    """Tote 정렬을 수행한다. 파지 전 최종 확인을 지원하는 aligner면 그 경로를 사용한다.
+
+    align_and_confirm()이 있으면 정렬 후 같은 자세에서 한 번 더 측정해 허용 범위를 재확인하고,
+    없으면 기존 align()만 호출한다. abort_check는 그 인자를 받는 aligner에만 전달하므로
+    임포트를 skills.tote_align이나 skills.tote_align_dual_recovery로 바꿔도 그대로 동작한다.
+    """
+    align = getattr(tote_aligner, "align_and_confirm", tote_aligner.align)
+    options = {"verify": True}
+
+    if abort_check is not None and "abort_check" in inspect.signature(align).parameters:
+        options["abort_check"] = abort_check
+
+    return align(robot, monitor, **options)
 
 
 def move_torso_and_head_async(
@@ -259,49 +310,60 @@ def detect_grasp_and_lift(
     robot,
     monitor,
     gripper,
-    # tote_aligner: ToteAligner,
+    tote_aligner: ToteAligner,
     gripper_target: float,
     gripper_torque: float,
+    abort_check=None,
 ) -> bool:
-    """GRASP에서 양팔과 Torso를 동시에 움직인 뒤 UP → PULL을 연속 수행한다."""
+    """BEFORE에서 GRASP_READY로 양팔과 Torso를 함께 움직이고, 양팔만 GRASP로 옮긴 뒤 UP → PULL을 연속 수행한다.
+
+    무한 재측정 aligner(skills.tote_align_infinite)를 쓰면 Tote 인식 실패로 끝나지 않고
+    같은 자리에서 계속 재측정하며, 파지 직전에 정렬 상태를 한 번 더 확인한다.
+    abort_check는 그 대기를 끊는 훅이며, WCS 취소 요청이 오면 예외를 던져 빠져나온다.
+    """
 
 
-    # print("[1/5] 현재 자세에서 Tote 영상 인식 + one-shot 정렬")
-    # if not tote_aligner.align(robot, monitor, verify=True):
-    #     print("Tote one-shot 정렬 실패")
-    #     return False
+    print("[1/6] 현재 자세에서 Tote 영상 인식 + one-shot 정렬 후 파지 전 최종 확인")
+    if not align_tote_once(tote_aligner, robot, monitor, abort_check=abort_check):
+        print("Tote one-shot 정렬 실패")
+        return False
 
-    print("[2/5] 현재 자세 → BEFORE")
+    print("[2/6] 현재 자세 → BEFORE")
     if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.0):
         print("BEFORE 자세 이동 실패")
         return False
 
-    print("[3/5] BEFORE → GRASP (양팔 + Torso 동시 이동)")
-    grasp_arm_move = move_arms_async(
+    print("[3/6] BEFORE → GRASP_READY (양팔 + Torso 동시 이동)")
+    ready_arm_move = move_arms_async(
         robot,
-        GRASP_RIGHT,
-        GRASP_LEFT,
-        "GRASP 양팔 이동 시작",
+        GRASP_READY_RIGHT,
+        GRASP_READY_LEFT,
+        "GRASP_READY 양팔 이동 시작",
         minimum_time=1.5,
     )
-    grasp_torso_move = move_torso_and_head_async(
+    ready_torso_move = move_torso_and_head_async(
         robot,
         GRASP_TORSO,
         HEAD_DOWN,
         "GRASP Torso 이동 시작",
         minimum_time=1.5,
     )
-    grasp_arm_ok = wait_for_arm_move(grasp_arm_move, "GRASP 양팔 자세 이동")
-    grasp_torso_ok = wait_for_head_move(grasp_torso_move, "GRASP Torso 자세 이동")
-    if not (grasp_arm_ok and grasp_torso_ok):
+    ready_arm_ok = wait_for_arm_move(ready_arm_move, "GRASP_READY 양팔 자세 이동")
+    ready_torso_ok = wait_for_head_move(ready_torso_move, "GRASP Torso 자세 이동")
+    if not (ready_arm_ok and ready_torso_ok):
+        print("GRASP_READY 자세 이동 실패")
+        return False
+
+    print("[4/6] GRASP_READY → GRASP (양팔)")
+    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
         print("GRASP 자세 이동 실패")
         return False
 
-    # print(f"그리퍼 닫기: target={gripper_target:.2f}, torque={gripper_torque:.2f} Nm")
-    # gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
-    # print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
+    print(f"그리퍼 닫기: target={gripper_target:.2f}, torque={gripper_torque:.2f} Nm")
+    gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
+    print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
 
-    print("[4-5/5] GRASP → UP → PULL (Torso + 양팔 J-curve 연속 이동)")
+    print("[5-6/6] GRASP → UP → PULL (Torso + 양팔 J-curve 연속 이동)")
     if not move_torso_and_arms_through_waypoint(
         robot,
         start_pose={"torso": GRASP_TORSO, "right_arm": GRASP_RIGHT, "left_arm": GRASP_LEFT},
@@ -339,7 +401,7 @@ def run_turn_and_go(robot, monitor) -> bool:
             OUTBOUND_DIRECT_TARGET,
             OUTBOUND_DIRECT_DURATION,
             True,
-            2.0,
+            0.2,
         )
         head_ok = wait_for_head_move(head_move, "Head 정면 자세 이동")
         head_move = None
@@ -354,20 +416,30 @@ def run_turn_and_go(robot, monitor) -> bool:
 # 3.놓는다
 def lower_release_and_retract(robot, gripper) -> bool:
     """AR 정렬 후 UP에서 DOWN로 내려놓고 그리퍼를 연 뒤, 손잡이에서 빠져나오도록 AFTER 자세로 양팔을 후퇴한다."""
-    print("[1/6] UP → stretch")
+    print("[1/3] UP → stretch")
+    
+    stretch_torso_move = move_torso_and_head_async(
+        robot,
+        STRETCH_TORSO,
+        HEAD_FORWARD,
+        "STRETCH Torso 이동 시작",
+        minimum_time=1.5,
+    )
+    
+    
     if not move_both_arms(robot, STRETCH_RIGHT, STRETCH_LEFT, minimum_time=1.0):
         print("STRETCH 자세 이동 실패")
         return False
-
-    print("[1/6] stretch -> Down ")
+        
+    print("[2/3] stretch -> Down ")
     if not move_both_arms(robot, DOWN_RIGHT, DOWN_LEFT, minimum_time=1.0):
         print("DOWN 자세 이동 실패")
         return False
-
-    # print("그리퍼 열기")
-    # gripper.open(duration=1.0)
-
-    print("DOWN → AFTER")
+    
+    print("그리퍼 열기")
+    gripper.open(duration=1.0)
+        
+    print("[3/3] DOWN → AFTER")
     if not move_both_arms(robot, AFTER_RIGHT, AFTER_LEFT, minimum_time=1.0):
         print("AFTER 자세 이동 실패")
         return False
@@ -376,8 +448,12 @@ def lower_release_and_retract(robot, gripper) -> bool:
 
 
 # 4.돌아온다
-def run_return_route(robot, monitor) -> bool:
-    """BACK을 단독 수행한 뒤 TURN + STRAIGHT direct target으로 복귀한다."""
+def run_return_route(robot, monitor, on_back_done=None) -> bool:
+    """BACK을 단독 수행한 뒤 TURN + STRAIGHT direct target으로 복귀한다.
+
+    on_back_done은 복귀 1/2(BACK 후진)가 끝난 직후, 회전 시작 전에 한 번 호출된다 (WCS COMPLETED 보고 지점).
+    콜백 예외는 복귀 주행을 막지 않는다.
+    """
     stream = robot.create_command_stream(priority=10)
     head_move = None
     arm_up_move = None
@@ -385,6 +461,12 @@ def run_return_route(robot, monitor) -> bool:
     try:
         if not run_mobile_leg(robot, monitor, stream, "복귀 1/2: BACK", RETURN_BACK_TARGET, 3.0, False, 0.0):
             return False
+
+        if on_back_done is not None:
+            try:
+                on_back_done()
+            except Exception as error:  # noqa: BLE001 - 보고 실패로 복귀 주행을 멈추지 않는다.
+                print(f"복귀 후진 완료 콜백 실패 (복귀는 계속 진행): {error}")
 
         arm_up_move = move_arms_async(
             robot,
@@ -426,24 +508,30 @@ def run_return_route(robot, monitor) -> bool:
 
 
 def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_index: int,
-              cancel_check=None) -> None:
+              cancel_check=None, readiness_wait=None, complete_report=None) -> None:
     """박스 인식/파지부터 이송, AR 정렬, 배치, 복귀까지 한 사이클을 수행하며 완료 후 다음 사이클을 같은 위치에서 시작한다.
 
     cancel_check는 WCS 취소 요청 확인용 콜백이다. 모션 도중이 아니라 단계 경계(안전 지점)에서만
     호출하므로, 취소 시 로봇은 마지막으로 완료한 단계의 자세에서 정지한다. 이후 복구는 운영자가 수행한다.
+    readiness_wait(operation)은 WCS PIO readiness 확인용 콜백이다. 파지 전 "LOAD", 배치 전 "UNLOAD"로 호출하며
+    READY가 될 때까지 블록한다(대기 중 취소 요청은 OrderCanceled, 최대 대기 초과는 ReadinessTimeout).
+    complete_report는 WCS COMPLETED 보고 콜백이다. 복귀 1/2(BACK 후진) 완료 직후 호출되며, 그 이후 구간은 오더 밖이다.
     """
     check_cancel = cancel_check or (lambda: None)
+    wait_ready = readiness_wait or (lambda operation: None)
 
     print(f"\n{'=' * 24} CYCLE {cycle_index} START {'=' * 24}")
     check_cancel()  # 파지 전
+    wait_ready("LOAD")  # WCS 도착 보고 + 로딩 가능 확인 (READY까지 대기)
     print(f"박스 파지 시작")
     if not detect_grasp_and_lift(
         robot,
         monitor,
         gripper,
-        # tote_aligner=tote_aligner,
+        tote_aligner=tote_aligner,
         gripper_target=args.gripper_target,
         gripper_torque=args.gripper_torque,
+        abort_check=check_cancel,
     ):
         raise RuntimeError("Tote 인식 / 정렬 / 파지 실패")
 
@@ -452,10 +540,11 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
     if not run_turn_and_go(robot, monitor):
         raise RuntimeError("이송 direct target 주행 실패")
 
-    # check_cancel()  # AR 정렬 전
-    # print("AR 마커 one-shot 정렬")
-    # if not ar_aligner.align(robot, monitor):
-    #     raise RuntimeError("AR 마커 정렬 실패")
+    check_cancel()  # AR 정렬 전
+    wait_ready("UNLOAD")  # WCS 도착 보고 + 언로딩 가능 확인 (READY까지 대기)
+    print("AR 마커 one-shot 정렬")
+    if not ar_aligner.align(robot, monitor):
+        raise RuntimeError("AR 마커 정렬 실패")
 
     check_cancel()  # 배치 전
     if not lower_release_and_retract(robot, gripper):
@@ -466,7 +555,9 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
         f"복귀 시작: BACK {describe_target(RETURN_BACK_TARGET)} → "
         f"TURN + STRAIGHT direct {describe_target(RETURN_TURN_AND_STRAIGHT_TARGET)}"
     )
-    if not run_return_route(robot, monitor):
+    # COMPLETED는 복귀 1/2(BACK) 완료 시점에 보고된다. 이후 회전·복귀 실패는 오더가 이미 종료된 뒤라
+    # FAILED 콜백 없이 status(ERROR/error_message)로만 전달된다.
+    if not run_return_route(robot, monitor, on_back_done=complete_report):
         raise RuntimeError("복귀 주행 실패")
 
     print(f"{'=' * 24} CYCLE {cycle_index} DONE {'=' * 25}")
@@ -476,6 +567,28 @@ def run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_ind
 # ------------------------------------------------------------------
 #    ##############            Main           #################
 # ------------------------------------------------------------------
+
+
+def _make_readiness_wait(wcs_publisher: WcsPublisher):
+    """파지/배치 전 호출: 도착 보고(ARRIVED_AT_FROM/TO) 후 PIO readiness READY까지 대기한다."""
+    where = {"LOAD": "FROM", "UNLOAD": "TO"}
+
+    def wait(operation: str) -> None:
+        wcs_publisher.report_arrival(where[operation])  # 실패해도 publisher 큐가 재시도한다
+        print(f"WCS {operation} readiness 확인 중...")
+        wcs_publisher.wait_until_ready(operation)
+
+    return wait
+
+
+def _make_complete_report(wcs_publisher: WcsPublisher, cycle_index: int):
+    """복귀 1/2(BACK 후진) 완료 직후 호출: 현재 오더를 COMPLETED로 보고한다."""
+
+    def report() -> None:
+        print(f"WCS COMPLETED 보고 (사이클 {cycle_index}, 복귀 후진 완료 시점)")
+        wcs_publisher.complete_order()
+
+    return report
 
 
 def main() -> None:
@@ -493,12 +606,9 @@ def main() -> None:
 
     robot = initialize_mobile(args.address, args.model, power=".*", servo=".*", unlimited=False)
     gripper = None
-    head_camera = None
-    # head_camera = RealSenseCamera(HEAD_CAM_WIDTH, HEAD_CAM_HEIGHT, HEAD_CAM_FPS, serial=args.camera_serial)
-    tote_aligner = None
-    ar_aligner = None
-    # tote_aligner = ToteAligner(camera=head_camera, show=args.show_tote)
-    # ar_aligner = ARAligner(marker_id=args.marker_id, camera=head_camera)
+    head_camera = RealSenseCamera(HEAD_CAM_WIDTH, HEAD_CAM_HEIGHT, HEAD_CAM_FPS, serial=args.camera_serial)
+    tote_aligner = ToteAligner(camera=head_camera, show=args.show_tote)
+    ar_aligner = ARAligner(marker_id=args.marker_id, camera=head_camera, forward_offset_m=AR_FORWARD_OFFSET_M)
     monitor = OdometryMonitor()
     wcs_publisher = WcsPublisher(robot_model=robot.model())
     state_update_started = False
@@ -516,9 +626,9 @@ def main() -> None:
         robot.set_tool_flange_output_voltage("left", 12)
         time.sleep(0.5)
 
-        # gripper = GripperController(position_torque=args.gripper_torque)
-        # gripper.connect()
-        # gripper.open(duration=2.0)
+        gripper = GripperController(position_torque=args.gripper_torque)
+        gripper.connect()
+        gripper.open(duration=2.0)
 
         # SDK state 구독은 한 번만 시작하고, 같은 state를 오도메트리와 WCS 상태 저장부에 함께 전달한다.
         def on_robot_state(state, *callback_args):
@@ -545,8 +655,8 @@ def main() -> None:
             f"Head 공용 카메라 시작: serial={args.camera_serial}, "
             f"{HEAD_CAM_WIDTH}x{HEAD_CAM_HEIGHT}@{HEAD_CAM_FPS}"
         )
-        # head_camera.start()
-        # head_camera_started = True
+        head_camera.start()
+        head_camera_started = True
 
         cycle_index = 1
 
@@ -563,7 +673,11 @@ def main() -> None:
             try:
                 run_cycle(robot, monitor, gripper, tote_aligner, ar_aligner, args, cycle_index,
                           cancel_check=None if args.no_wcs_order
-                          else wcs_publisher.raise_if_cancel_requested)
+                          else wcs_publisher.raise_if_cancel_requested,
+                          readiness_wait=None if args.no_wcs_order
+                          else _make_readiness_wait(wcs_publisher),
+                          complete_report=None if args.no_wcs_order
+                          else _make_complete_report(wcs_publisher, cycle_index))
             except OrderCanceled as cancel:
                 # 단계 경계에서 안전 정지한 상태. CANCELED를 보고하고 다음 오더를 기다린다.
                 # 토트를 든 채 정지했을 수 있으며, 이후 복구는 운영자가 수행한다 (v07.3 4.8).
@@ -575,6 +689,7 @@ def main() -> None:
                 continue
             wcs_publisher.set_work_state("DONE")
             if not args.no_wcs_order:
+                # 정상이면 복귀 후진 완료 시점에 이미 보고되어 no-op. 콜백이 호출되지 못한 경로의 안전망.
                 wcs_publisher.complete_order()
             completed_cycles += 1
             cycle_index += 1
@@ -585,6 +700,12 @@ def main() -> None:
         wcs_publisher.set_work_state("IDLE")
         wcs_publisher.fail_order("사용자가 데모를 중단했습니다")  # 진행 중 오더가 없으면 no-op
         print(f"\n사용자가 반복 데모를 중단했습니다. 완료 사이클: {completed_cycles}")
+
+    except ReadinessTimeout as error:
+        # WCS 설비가 제한 시간 안에 READY가 되지 않았다. 로봇은 단계 경계에서 정지한 상태다 (T-04).
+        wcs_publisher.set_work_state("ERROR", str(error))
+        wcs_publisher.fail_order(str(error))
+        print(f"WCS PIO readiness 대기 초과로 중단: {error} | 완료 사이클: {completed_cycles}")
 
     except Exception as error:
         wcs_publisher.set_work_state("ERROR", str(error))
@@ -611,8 +732,8 @@ def main() -> None:
             except Exception:
                 pass
 
-        # if gripper is not None:
-        #     gripper.disconnect()
+        if gripper is not None:
+            gripper.disconnect()
 
         try:
             robot.set_tool_flange_output_voltage("right", 0)
