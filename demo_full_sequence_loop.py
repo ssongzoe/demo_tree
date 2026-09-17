@@ -41,9 +41,8 @@ from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_arms_through_waypoint, move_torso_and_head
 from skills.ar_align import ARAligner
-from skills.tote_align_infinite import ToteAligner  # 인식 실패 시 무한 재측정
-#from skills.tote_align import ToteAligner
-#from skills.tote_align_dual_recovery import ToteAligner
+# from skills.tote_align_infinite import ToteAligner  # 인식 실패 시 무한 재측정
+from skills.tote_align_dual_recovery_infinite import ToteAligner
 from utils.ar_marker import RealSenseCamera
 
 # -----------------------------------------------------------------------------
@@ -85,13 +84,16 @@ GRASP_READY_LEFT = np.deg2rad([-17.100, 43.961, 39.402, -68.996, 79.612, 87.254,
 
 # GRASP_RIGHT = np.deg2rad([-28.592, -28.537, -30.579, -80.469, -63.332, 91.746, -7.972]).tolist()
 # GRASP_LEFT = np.deg2rad([-28.592, 28.537, 30.579, -80.469, 63.332, 91.746, 7.972]).tolist()
-GRASP_RIGHT = np.deg2rad([-28.615, -28.590, -32.317, -80.741, -63.729, 94.080, -7.972]).tolist()
-GRASP_LEFT = np.deg2rad([-28.615, 28.590, 32.317, -80.741, 63.729, 94.080, 7.972]).tolist()
+GRASP_RIGHT = np.deg2rad([-37.677, -32.285, -25.077, -73.673, -59.182, 93.033, -7.714]).tolist()
+GRASP_LEFT = np.deg2rad([-31.801, 29.271, 32.629, -76.152, 62.596, 91.756, 7.062]).tolist()
 
 GRASP_TORSO = np.deg2rad([0.020, 34.030, -53.957, 40.917, 0.050, 0.010]).tolist()
 
-UP_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
-UP_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
+# UP_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
+# UP_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
+# 가이드와 박스 간섭을 피하기 위해 기존 UP 대비 양팔 end-effector를 base 기준 +z 0.03m 올린 자세 (자세 유지, IK 계산)
+UP_RIGHT = np.deg2rad([-35.151, -36.769, -22.556, -72.257, -67.335, 93.987, -16.942]).tolist()
+UP_LEFT = np.deg2rad([-35.151, 36.769, 22.556, -72.257, 67.335, 93.987, 16.942]).tolist()
 UP_TORSO = INITIAL_TORSO.copy()
 
 PULL_RIGHT = np.deg2rad([-4.50, -28.21, -33.62, -106.81, -74.26, 99.28, -19.51]).tolist()
@@ -100,8 +102,9 @@ PULL_LEFT = np.deg2rad([-4.50, 28.21, 33.62, -106.81, 74.26, 99.28, 19.52]).toli
 # DOWN_RIGHT = np.deg2rad([-37.490, -32.697, -20.042, -47.921, -65.180, 80.655, 3.111]).tolist()
 # DOWN_LEFT = np.deg2rad([-37.490, 32.697, 20.042, -47.921, 65.180, 80.655, -3.111]).tolist()
 
-DOWN_RIGHT = np.deg2rad([-37.520, -32.333, -20.061, -45.293, -65.269, 79.082, 1.384]).tolist()
-DOWN_LEFT = np.deg2rad([-37.520, 32.333, 20.061, -45.293, 65.269, 79.082, -1.384]).tolist()
+DOWN_RIGHT = np.deg2rad([-34.315, -31.803, -20.478, -50.778, -65.506, 80.258, -0.714]).tolist()
+DOWN_LEFT = np.deg2rad([-31.398, 31.335, 20.918, -55.653, 65.765, 81.310, 2.495]).tolist()
+
 
 # STRETCH_RIGHT = np.deg2rad([-34.28, -35.32, -21.87, -68.29, -66.50, 90.79, -12.55]).tolist()
 # STRETCH_LEFT = np.deg2rad([-34.28, 35.32, 21.87, -68.29, 66.50, 90.79, 12.55]).tolist()
@@ -124,8 +127,8 @@ AFTER_LEFT = np.deg2rad([-33.680, 41.190, 26.891, -37.858, 69.438, 74.159, 0.359
 BACK_RIGHT = np.deg2rad([54.000, -25.000, -58.000, -138.000, -87.000, 63.000, -7.000]).tolist()
 BACK_LEFT = np.deg2rad([54.000, 25.000, 58.000, -138.000, 87.000, 63.000, 7.000]).tolist()
 
-HEAD_DOWN = np.deg2rad([-3.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
-HEAD_FORWARD = np.deg2rad([-3.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
+HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
+HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
 
 HEAD_MOVE_TIME = 2.0
 ARM_UP_MOVE_TIME = 2.0
@@ -143,7 +146,8 @@ LIFT_PULL_STREAM_RATE_HZ = 100.0
 # 아래 target 값만 수정하면 실제 실행 로그도 현재 값에 맞춰 자동으로 바뀐다.
 # -----------------------------------------------------------------------------
 
-OUTBOUND_DIRECT_TARGET = (-0.80, 1.40, math.radians(+184.85))
+OUTBOUND_BACK_TARGET = (-0.35, 0.0, 0.0)
+OUTBOUND_DIRECT_TARGET = (-0.40, 1.40, math.radians(+184.85))
 OUTBOUND_DIRECT_DURATION = 8.0 # 가는거 8초
 OUTBOUND_HEAD_DELAY = 2.0
 
@@ -188,8 +192,9 @@ def align_tote_once(tote_aligner, robot, monitor, abort_check=None) -> bool:
     align = getattr(tote_aligner, "align_and_confirm", tote_aligner.align)
     options = {"verify": True}
 
-    if abort_check is not None and "abort_check" in inspect.signature(align).parameters:
-        options["abort_check"] = abort_check
+    # if abort_check is not None and "abort_check" in inspect.signature(align).parameters:
+    #     options["abort_check"] = abort_check
+    # 
 
     return align(robot, monitor, **options)
 
@@ -329,7 +334,7 @@ def detect_grasp_and_lift(
         return False
 
     print("[2/6] 현재 자세 → BEFORE")
-    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.0):
+    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.5):
         print("BEFORE 자세 이동 실패")
         return False
 
@@ -393,6 +398,12 @@ def run_turn_and_go(robot, monitor) -> bool:
             f"이송 시작 {OUTBOUND_HEAD_DELAY:.1f}초 후 정면 AR 인식을 위해 Head 들기",
             delay=OUTBOUND_HEAD_DELAY,
         )
+
+
+        if not run_mobile_leg(robot, monitor, stream, "BACKWARD ", OUTBOUND_BACK_TARGET, 3.0, False, 0.0):
+            return False
+
+
         route_ok = run_mobile_leg(
             robot,
             monitor,
