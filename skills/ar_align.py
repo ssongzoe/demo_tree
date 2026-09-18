@@ -25,8 +25,8 @@ CAM_HEIGHT = 480
 CAM_FPS = 30
 
 # 실제 배치 목표 위치에서 측정한 marker pose
-TARGET_MARKER_POS = np.array([0.025, 0.069, 0.13], dtype=np.float64)
-TARGET_MARKER_YAW_DEG = 1.74
+TARGET_MARKER_POS = np.array([0.025, 0.069, 0.095], dtype=np.float64)
+TARGET_MARKER_YAW_DEG = 0.0
 
 POSITION_TOL = 0.01
 YAW_TOL_DEG = 2.0
@@ -35,7 +35,7 @@ VERTICAL_WARN_M = 0.05
 ALIGN_LINEAR_SPEED = 0.15
 ALIGN_ANGULAR_SPEED = 0.5
 QUINTIC_PEAK = 1.875
-MIN_LEG_TIME = 1.0
+MIN_LEG_TIME = 0.8
 SETTLE_S = 0.2
 
 # Tote calibration과 같은 640x480@30 공용 stream에서, 이동 후 쌓인 frame은 조금만 버리고 fresh detection 4개를 측정한다.

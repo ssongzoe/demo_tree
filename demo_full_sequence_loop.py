@@ -41,8 +41,8 @@ from control.gripper_controller import GripperController
 from control.mobile_controller import OdometryMonitor, build_leg, initialize_mobile, move_leg, odom_pose, wait_for_odometry
 from control.robot_controller import move_both_arms, move_torso_and_arms_through_waypoint, move_torso_and_head
 from skills.ar_align import ARAligner
-# from skills.tote_align_infinite import ToteAligner  # 인식 실패 시 무한 재측정
-from skills.tote_align_dual_recovery_infinite import ToteAligner
+from skills.tote_align_new_bracket import ToteAligner   #New Head
+# from skills.tote_align_dual_recovery_infinite import ToteAligner #old bracket
 from utils.ar_marker import RealSenseCamera
 
 # -----------------------------------------------------------------------------
@@ -63,6 +63,13 @@ HEAD_CAM_FPS = 30
 
 DEFAULT_GRIPPER_TARGET = 0.80
 DEFAULT_GRIPPER_TORQUE = 0.20
+
+# 성공 파지 위치 기준
+GRASP_POSITION_MIN = 0.45
+GRASP_POSITION_MAX = 0.58
+
+# 파지 실패 후 ALIGN 재시도 전에 1 cm 후진
+GRASP_RETRY_BACK_M = -0.01
 
 # Tote vision과 grasp pose는 이 torso 기준으로 맞춰져 있으므로 프로그램 시작 시 한 번 정확히 고정한다.
 INITIAL_TORSO = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
@@ -121,11 +128,12 @@ STRETCH_TORSO = np.deg2rad([0.000, 33.773, -46.870, 23.097, 0.000, 0.001]).tolis
 AFTER_RIGHT = np.deg2rad([-33.680, -41.190, -26.891, -37.858, -69.438, 74.159, -0.359]).tolist()
 AFTER_LEFT = np.deg2rad([-33.680, 41.190, 26.891, -37.858, 69.438, 74.159, 0.359]).tolist()
 
-# BACK_RIGHT = np.deg2rad([-13.642, -27.690, -33.932, -95.436, -56.100, 59.591, -7.149]).tolist()
-# BACK_LEFT = np.deg2rad([-13.642, 27.690, 33.932, -95.436, 56.100, 59.591, 7.149]).tolist()
+BACK_RIGHT = np.deg2rad([6.997, -32.316, -38.234, -129.125, -58.968, 85.854, -6.935]).tolist()
+BACK_LEFT = np.deg2rad([6.997, 32.316, 38.234, -129.125, 58.968, 85.854, 6.935]).tolist()
 
-BACK_RIGHT = np.deg2rad([54.000, -25.000, -58.000, -138.000, -87.000, 63.000, -7.000]).tolist()
-BACK_LEFT = np.deg2rad([54.000, 25.000, 58.000, -138.000, 87.000, 63.000, 7.000]).tolist()
+# BACK_RIGHT = np.deg2rad([54.000, -25.000, -58.000, -138.000, -87.000, 63.000, -7.000]).tolist()
+# BACK_LEFT = np.deg2rad([54.000, 25.000, 58.000, -138.000, 87.000, 63.000, 7.000]).tolist()
+
 
 HEAD_DOWN = np.deg2rad([0.0, 43.0]).tolist()    # Tote 인식 / 복귀 자세
 HEAD_FORWARD = np.deg2rad([0.0, 0.0]).tolist()  # 정면 AR 마커 인식 자세
@@ -327,46 +335,133 @@ def detect_grasp_and_lift(
     abort_check는 그 대기를 끊는 훅이며, WCS 취소 요청이 오면 예외를 던져 빠져나온다.
     """
 
+    while True:
+        print("[1/6] Tote 영상 인식 + one-shot 정렬 후 파지 전 최종 확인")
+        if not align_tote_once(tote_aligner, robot, monitor, abort_check=abort_check):
+            print("Tote one-shot 정렬 실패")
+            return False
 
-    print("[1/6] 현재 자세에서 Tote 영상 인식 + one-shot 정렬 후 파지 전 최종 확인")
-    if not align_tote_once(tote_aligner, robot, monitor, abort_check=abort_check):
-        print("Tote one-shot 정렬 실패")
-        return False
+        print("[2/6] 현재 자세 → BEFORE")
+        if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.5):
+            print("BEFORE 자세 이동 실패")
+            return False
 
-    print("[2/6] 현재 자세 → BEFORE")
-    if not move_both_arms(robot, BEFORE_RIGHT, BEFORE_LEFT, minimum_time=1.5):
-        print("BEFORE 자세 이동 실패")
-        return False
+        print("[3/6] BEFORE → GRASP_READY (양팔 + Torso 동시 이동)")
+        ready_arm_move = move_arms_async(
+            robot,
+            GRASP_READY_RIGHT,
+            GRASP_READY_LEFT,
+            "GRASP_READY 양팔 이동 시작",
+            minimum_time=1.5,
+        )
 
-    print("[3/6] BEFORE → GRASP_READY (양팔 + Torso 동시 이동)")
-    ready_arm_move = move_arms_async(
-        robot,
-        GRASP_READY_RIGHT,
-        GRASP_READY_LEFT,
-        "GRASP_READY 양팔 이동 시작",
-        minimum_time=1.5,
-    )
-    ready_torso_move = move_torso_and_head_async(
-        robot,
-        GRASP_TORSO,
-        HEAD_DOWN,
-        "GRASP Torso 이동 시작",
-        minimum_time=1.5,
-    )
-    ready_arm_ok = wait_for_arm_move(ready_arm_move, "GRASP_READY 양팔 자세 이동")
-    ready_torso_ok = wait_for_head_move(ready_torso_move, "GRASP Torso 자세 이동")
-    if not (ready_arm_ok and ready_torso_ok):
-        print("GRASP_READY 자세 이동 실패")
-        return False
+        ready_torso_move = move_torso_and_head_async(
+            robot,
+            GRASP_TORSO,
+            HEAD_DOWN,
+            "GRASP Torso 이동 시작",
+            minimum_time=1.5,
+        )
 
-    print("[4/6] GRASP_READY → GRASP (양팔)")
-    if not move_both_arms(robot, GRASP_RIGHT, GRASP_LEFT, minimum_time=1.0):
-        print("GRASP 자세 이동 실패")
-        return False
+        ready_arm_ok = wait_for_arm_move(
+            ready_arm_move,
+            "GRASP_READY 양팔 자세 이동",
+        )
+        ready_torso_ok = wait_for_head_move(
+            ready_torso_move,
+            "GRASP Torso 자세 이동",
+        )
 
-    print(f"그리퍼 닫기: target={gripper_target:.2f}, torque={gripper_torque:.2f} Nm")
-    gripper.close(target=gripper_target, torque=gripper_torque, duration=0.8)
-    print(f"그리퍼 현재 위치: {gripper.get_positions().round(3)}")
+        if not (ready_arm_ok and ready_torso_ok):
+            print("GRASP_READY 자세 이동 실패")
+            return False
+
+        print("[4/6] GRASP_READY → GRASP (양팔)")
+        if not move_both_arms(
+            robot,
+            GRASP_RIGHT,
+            GRASP_LEFT,
+            minimum_time=1.0,
+        ):
+            print("GRASP 자세 이동 실패")
+            return False
+
+        print(
+            f"그리퍼 닫기: target={gripper_target:.2f}, "
+            f"torque={gripper_torque:.2f} Nm"
+        )
+        gripper.close(
+            target=gripper_target,
+            torque=gripper_torque,
+            duration=0.8,
+        )
+
+        positions = gripper.get_positions()
+        print(f"그리퍼 현재 위치: {positions.round(3)}")
+
+        grasp_ok = np.all(
+            (positions >= GRASP_POSITION_MIN)
+            & (positions <= GRASP_POSITION_MAX)
+        )
+
+        if grasp_ok:
+            print("그리퍼 파지 확인 성공")
+            break
+
+        print(
+            "그리퍼 파지 실패 감지 "
+            f"{positions.round(3)} → OPEN → BEFORE → 1 cm 후진 → ALIGN 재시도"
+        )
+
+        gripper.open(duration=0.8)
+
+
+        if not move_both_arms(
+            robot,
+            BEFORE_RIGHT,
+            BEFORE_LEFT,
+            minimum_time=1.0,
+        ):
+            print("파지 실패 후 BEFORE 복귀 실패")
+            return False
+
+        # Tote 정렬 기준 자세로 복귀
+        torso_head_move = move_torso_and_head_async(
+            robot,
+            INITIAL_TORSO,
+            HEAD_DOWN,
+            "파지 실패 → Tote 정렬 Torso / Head 복귀",
+            minimum_time=1.0,
+        )
+
+
+
+        if not wait_for_head_move(
+            torso_head_move,
+            "파지 실패 후 Torso / Head 복귀",
+        ):
+            return False
+
+        # 1 cm 뒤로 이동
+        stream = robot.create_command_stream(priority=10)
+        try:
+            if not run_mobile_leg(
+                robot,
+                monitor,
+                stream,
+                "파지 실패 후 1 cm 후진",
+                (GRASP_RETRY_BACK_M, 0.0, 0.0),
+                0.7,
+                True,
+                0.1,
+            ):
+                print("파지 실패 후 1 cm 후진 실패")
+                return False
+        finally:
+            stream.cancel()
+            stream.wait_for(500)
+
+        print("ALIGN부터 다시 시작")
 
     print("[5-6/6] GRASP → UP → PULL (Torso + 양팔 J-curve 연속 이동)")
     if not move_torso_and_arms_through_waypoint(

@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""RB-Y1 Tote local 3-DoF calibration.
+"""RB-Y1 Tote local 3-DoF calibration for the new head-camera bracket.
 
 Run this script with the robot placed at the exact desired grasp pose.
-The script measures the reference, visits +/-X, +/-Y and +/-Yaw poses,
-returns to the reference after every pose, and fits the complete 3x3 image
-Jacobian from actual odometry.
+The script never commands the robot forward beyond that reference pose.
+It measures X at 3 cm / 6 cm backward, then measures +/-Y and +/-Yaw from
+the 6 cm backward safety pose and fits the complete 3x3 image Jacobian from
+actual odometry.
 
 Feature vectors:
     LEFT   = [TL.x(px), TL.y(px), top_angle(deg)]
     RIGHT  = [TR.x(px), TR.y(px), top_angle(deg)]
     CENTER = [rim_center_x(px), rim_center_y(px), top_angle(deg)]
 
+After all samples, it returns through the 3 cm backward waypoint to the
+original reference pose and measures the final reference again.
 The saved JSON and printed constants are inputs for the next coupled aligner.
 """
 
@@ -45,10 +48,15 @@ from control.mobile_controller import (  # noqa: E402
 )
 from control.robot_controller import move_both_arms, move_torso_and_head  # noqa: E402
 from utils.ar_marker import RealSenseCamera  # noqa: E402
-from utils.tote_vision import detect_frame_feature, draw_feature, flush_camera  # noqa: E402
+from utils.tote_vision_new_bracket import (  # noqa: E402
+    detect_frame_feature,
+    draw_feature,
+    flush_camera,
+    reset_top_tracking,
+)
 
 
-WINDOW_NAME = "Tote Local Calibration v4"
+WINDOW_NAME = "Tote Local Calibration - New Bracket v7 Safe"
 
 
 @dataclass
@@ -244,6 +252,7 @@ def measure_window(
 ) -> WindowMeasurement:
     samples: list[FrameSample] = []
     start_time = time.monotonic()
+    reset_top_tracking()
     flush_camera(pipeline)
 
     while len(samples) < frame_count and time.monotonic() - start_time < timeout_s:
@@ -443,7 +452,7 @@ def main() -> None:
     camera_fps = 30
 
     initial_torso = np.deg2rad([0.0, 30.0, -50.0, 30.0, 0.0, 0.0]).tolist()
-    head_down = np.deg2rad([-3.0, 43.0]).tolist()
+    head_down = np.deg2rad([0.0, 43.0]).tolist()
     before_right = np.deg2rad(
         [-38.23, -53.19, -21.31, -48.14, -63.73, 81.18, 2.39]
     ).tolist()
@@ -451,20 +460,35 @@ def main() -> None:
         [-38.23, 53.19, 21.31, -48.14, 63.73, 81.18, -2.39]
     ).tolist()
 
-    parser = argparse.ArgumentParser(description="RB-Y1 Tote local 3x3 calibration v4")
+    parser = argparse.ArgumentParser(
+        description="RB-Y1 Tote safe backward-only 3x3 calibration v7"
+    )
     parser.add_argument("--address", default=address)
     parser.add_argument("--model", choices=("a", "m"), default="m")
     parser.add_argument("--camera-serial", default=camera_serial)
     parser.add_argument("--show-tote", action="store_true")
-    parser.add_argument("--x-step", type=float, default=0.03, help="X perturbation [m]")
-    parser.add_argument("--y-step", type=float, default=0.03, help="Y perturbation [m]")
+    parser.add_argument(
+        "--x-back-step",
+        type=float,
+        default=0.06,
+        help="Backward safety offset [m] (default: 0.06)",
+    )
+    parser.add_argument(
+        "--y-step",
+        type=float,
+        default=0.06,
+        help="Left/right perturbation at the backward safety pose [m]",
+    )
     parser.add_argument("--yaw-step", type=float, default=2.0, help="Yaw perturbation [deg]")
     parser.add_argument("--frames", type=int, default=80)
     parser.add_argument("--timeout", type=float, default=8.0)
     parser.add_argument("--angle-cluster-radius", type=float, default=0.45)
     parser.add_argument("--min-cluster-frames", type=int, default=30)
     parser.add_argument("--min-side-frames", type=int, default=20)
-    parser.add_argument("--output", default="tote_local_calibration_result.json")
+    parser.add_argument(
+        "--output",
+        default="tote_local_calibration_new_bracket_v7_safe.json",
+    )
     args = parser.parse_args()
 
     robot = initialize_mobile(
@@ -547,6 +571,16 @@ def main() -> None:
         print("로봇을 최종 파지 목표 자세에 놓아주세요.")
         print("앞으로 1 cm가 최종 목표라면 지금 그 1 cm를 포함한 자세여야 합니다.")
         print("Tote, Head/Torso, 양팔 BEFORE 자세가 실제 데모와 같은지 확인하세요.")
+        print(
+            f"기준 자세를 측정한 뒤 뒤로 {args.x_back_step * 50:.1f} cm, "
+            f"{args.x_back_step * 100:.1f} cm 이동합니다."
+        )
+        print(
+            f"그다음 뒤쪽 안전 위치에서 Y +/-{args.y_step * 100:.1f} cm, "
+            f"Yaw +/-{args.yaw_step:.1f} deg를 측정합니다."
+        )
+        print("기준 자세보다 앞쪽(+X)으로는 절대 명령하지 않습니다.")
+        print("측정 종료 후 -6 cm -> -3 cm -> 기준 자세 순서로 복귀합니다.")
         print("주변 사람과 장애물을 치운 뒤 Enter를 누르면 자동 이동을 시작합니다.")
         print("=" * 88)
         input("준비되면 Enter > ")
@@ -554,16 +588,47 @@ def main() -> None:
         reference_pose = odom_pose(monitor.odom)
         measure("REFERENCE_INITIAL", reference_pose)
 
-        perturbations = [
-            ("PLUS_X", np.asarray([+args.x_step, 0.0, 0.0])),
-            ("MINUS_X", np.asarray([-args.x_step, 0.0, 0.0])),
-            ("PLUS_Y", np.asarray([0.0, +args.y_step, 0.0])),
-            ("MINUS_Y", np.asarray([0.0, -args.y_step, 0.0])),
-            ("PLUS_YAW", np.asarray([0.0, 0.0, +args.yaw_step])),
-            ("MINUS_YAW", np.asarray([0.0, 0.0, -args.yaw_step])),
+        print()
+        print("REFERENCE 검출값과 화면의 TOP/TL/TR을 확인하세요.")
+        print(
+            f"다음 이동은 토트 반대 방향(-X)으로 "
+            f"{args.x_back_step * 50:.1f} cm 후진입니다."
+        )
+        input("후방과 좌우 이동 공간이 괜찮으면 Enter > ")
+
+        half_back_offset = np.asarray([-0.5 * args.x_back_step, 0.0, 0.0])
+        safe_back_offset = np.asarray([-args.x_back_step, 0.0, 0.0])
+
+        half_back_pose = offset_world_pose(reference_pose, half_back_offset)
+        if not move_to_pose(robot, monitor, half_back_pose, "BACK_X_HALF 이동"):
+            raise RuntimeError("BACK_X_HALF 이동 실패")
+        measure("BACK_X_HALF", reference_pose)
+
+        safe_back_pose = offset_world_pose(reference_pose, safe_back_offset)
+        if not move_to_pose(robot, monitor, safe_back_pose, "BACK_X_FULL 이동"):
+            raise RuntimeError("BACK_X_FULL 이동 실패")
+        measure("BACK_X_FULL", reference_pose)
+
+        safe_perturbations = [
+            (
+                "SAFE_PLUS_Y",
+                np.asarray([-args.x_back_step, +args.y_step, 0.0]),
+            ),
+            (
+                "SAFE_MINUS_Y",
+                np.asarray([-args.x_back_step, -args.y_step, 0.0]),
+            ),
+            (
+                "SAFE_PLUS_YAW",
+                np.asarray([-args.x_back_step, 0.0, +args.yaw_step]),
+            ),
+            (
+                "SAFE_MINUS_YAW",
+                np.asarray([-args.x_back_step, 0.0, -args.yaw_step]),
+            ),
         ]
 
-        for label, requested_offset in perturbations:
+        for label, requested_offset in safe_perturbations:
             print()
             print("#" * 88)
             print(
@@ -576,9 +641,18 @@ def main() -> None:
                 raise RuntimeError(f"{label} 이동 실패")
             measure(label, reference_pose)
 
-            if not move_to_pose(robot, monitor, reference_pose, f"{label} 기준 복귀"):
-                raise RuntimeError(f"{label} 기준 복귀 실패")
-            measure(f"REFERENCE_AFTER_{label}", reference_pose)
+            if not move_to_pose(robot, monitor, safe_back_pose, f"{label} 안전 위치 복귀"):
+                raise RuntimeError(f"{label} 안전 위치 복귀 실패")
+            measure(f"SAFE_AFTER_{label}", reference_pose)
+
+        print()
+        print("모든 측정 완료: 두 단계로 최종 기준 자세에 복귀합니다.")
+        if not move_to_pose(robot, monitor, half_back_pose, "최종 -3 cm 지점 복귀"):
+            raise RuntimeError("최종 -3 cm 지점 복귀 실패")
+        if not move_to_pose(robot, monitor, reference_pose, "최종 기준 자세 복귀"):
+            raise RuntimeError("최종 기준 자세 복귀 실패")
+        measure("REFERENCE_FINAL", reference_pose)
+        print("최종 기준 자세 복귀 및 재측정 완료")
 
         results = {
             "LEFT": fit_local_model(records, "left"),
@@ -597,10 +671,13 @@ def main() -> None:
 
         output = {
             "settings": {
+                "setup_name": "new_head_bracket_3cm_forward",
+                "calibration_version": 7,
+                "motion_pattern": "backward_samples_then_reference_return",
                 "camera_serial": args.camera_serial,
                 "camera_size": [camera_width, camera_height],
                 "camera_fps": camera_fps,
-                "x_step_m": args.x_step,
+                "x_back_step_m": args.x_back_step,
                 "y_step_m": args.y_step,
                 "yaw_step_deg": args.yaw_step,
                 "frames": args.frames,
